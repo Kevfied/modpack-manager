@@ -9,6 +9,7 @@
 [![Latest release](https://img.shields.io/github/v/release/Kevfied/modpack-manager?color=white&label=release)](https://github.com/Kevfied/modpack-manager/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-white)](#installation)
 [![Built with Tauri](https://img.shields.io/badge/tauri-v2-white)](https://v2.tauri.app)
+[![License: MIT](https://img.shields.io/badge/license-MIT-white)](LICENSE)
 [![Stack](https://img.shields.io/badge/stack-Rust%20%2B%20React%20%2B%20TS-white)](#tech-stack)
 
 </div>
