@@ -1,4 +1,4 @@
-# release.ps1 — build + sign + publish a Modpack Manager update to the LAN.
+﻿# release.ps1 — build + sign + publish a Modpack Manager update to the LAN.
 #
 # Strict rule: NOTHING is advertised until you answer "y" at the publish
 # prompt. Building the app alone never makes it available to friends.
@@ -98,8 +98,12 @@ if ($BundleDir) {
             default { Fail "-Bump must be major|minor|patch" }
         }
         $newVer = $parts -join "."
-        ($conf | ConvertTo-Json -Depth 10).Replace("""$($conf.version)""", """$newVer""") | Set-Content $TauriConf -Encoding UTF8
-        (Get-Content $CargoToml -Raw) -replace '(?m)^version = "[^"]+"', "version = `"$newVer`"" | Set-Content $CargoToml -Encoding UTF8
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        foreach ($f in @($TauriConf, $CargoToml, (Join-Path $Repo "package.json"))) {
+            $text = Get-Content $f -Raw
+            $text = $text -replace '(?m)("version"\s*:\s*|^version = )"[^"]+"', "`$1`"$newVer`""
+            [System.IO.File]::WriteAllText($f, $text, $utf8NoBom)
+        }
         Write-Host "Bumped version -> $newVer"
     }
     $Version = (Get-Content $TauriConf -Raw | ConvertFrom-Json).version

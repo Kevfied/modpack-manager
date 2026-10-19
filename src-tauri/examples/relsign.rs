@@ -6,7 +6,18 @@
 //!   relsign sign <key-file> <file> <sig>  — detached sign
 //!   relsign pubkey <key-file>             — print base64 pubkey
 
-use minisign::{KeyPair, PublicKey, SecretKey};
+use minisign::{KeyPair, PublicKey, SecretKey, SecretKeyBox};
+
+fn load_sk(path: &str) -> SecretKey {
+    let s = std::fs::read_to_string(path).unwrap();
+    let sk_box = SecretKeyBox::from_string(&s).unwrap();
+    // Passwordless keys need the unencrypted path; from_box() expects a
+    // KDF-encrypted box and rejects KDF_NONE as "Key is not encrypted".
+    match sk_box.clone().into_unencrypted_secret_key() {
+        Ok(sk) => sk,
+        Err(_) => sk_box.into_secret_key(None).unwrap(),
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -18,7 +29,7 @@ fn main() {
             println!("{}", kp.pk.to_base64());
         }
         Some("sign") => {
-            let sk = SecretKey::from_file(&args[2], None).unwrap();
+            let sk = load_sk(&args[2]);
             let pk = PublicKey::from_secret_key(&sk).unwrap();
             let data = std::fs::read(&args[3]).unwrap();
             let sig =
@@ -27,7 +38,7 @@ fn main() {
             std::fs::write(&args[4], sig.to_string()).unwrap();
         }
         Some("pubkey") => {
-            let sk = SecretKey::from_file(&args[2], None).unwrap();
+            let sk = load_sk(&args[2]);
             println!("{}", PublicKey::from_secret_key(&sk).unwrap().to_base64());
         }
         _ => {
