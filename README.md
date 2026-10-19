@@ -13,6 +13,9 @@
 
 </div>
 
+> ### 📖 Just want to use the app? → [**Read the User Manual**](USER-MANUAL.md)
+> Step-by-step for players — install, load a pack, sync with friends. No technical knowledge needed.
+
 ---
 
 ## What it does
@@ -31,8 +34,6 @@ The UI is a compact, monochrome, terminal-style window — sharp edges, no clutt
 ---
 
 ## Installation
-
-> **Just here to use the app?** Read the [**User Manual**](USER-MANUAL.md) — step-by-step for players, no technical knowledge needed.
 
 Grab the latest installer from [**Releases**](https://github.com/Kevfied/modpack-manager/releases/latest):
 
