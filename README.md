@@ -32,6 +32,8 @@ The UI is a compact, monochrome, terminal-style window — sharp edges, no clutt
 
 ## Installation
 
+> **Just here to use the app?** Read the [**User Manual**](USER-MANUAL.md) — step-by-step for players, no technical knowledge needed.
+
 Grab the latest installer from [**Releases**](https://github.com/Kevfied/modpack-manager/releases/latest):
 
 | File | Notes |
