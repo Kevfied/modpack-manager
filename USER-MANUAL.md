@@ -10,7 +10,8 @@ For friends & players. No technical knowledge needed — just follow the steps f
 - [Connect — sync mods with friends](#6-connect--sync-mods-with-friends)
 - [App updates](#7-app-updates)
 - [Where your stuff lives](#8-where-your-stuff-lives)
-- [Troubleshooting](#9-troubleshooting)
+- [Uninstalling](#9-uninstalling)
+- [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -170,7 +171,16 @@ Synced modpack files themselves land in a subfolder there; the Loader tab knows 
 
 ---
 
-## 9. Troubleshooting
+## 9. Uninstalling
+
+1. **Settings → Apps → Installed apps → "Modpack Manager" → ⋯ → Uninstall** (also works from Control Panel → Programs and Features, or right-clicking the Start menu entry).
+2. That removes the program and its shortcuts.
+
+**Your data stays behind** on purpose — `%LOCALAPPDATA%\modpack-manager\` keeps your joined networks, synced packs, and update state, so reinstalling later puts everything back. To wipe it completely, delete that folder after uninstalling (or tick "delete application data" if the uninstaller offers it).
+
+---
+
+## 10. Troubleshooting
 
 | Problem | Fix |
 |---|---|
