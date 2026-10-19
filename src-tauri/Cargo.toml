@@ -1,0 +1,50 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "Modpack Manager — Minecraft modpack builder"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
+zip = { version = "6", default-features = false, features = ["deflate"] }
+sha1 = "0.10"
+sha2 = "0.10"
+walkdir = "2"
+toml = "0.9"
+dirs = "6"
+hex = "0.4"
+anyhow = "1"
+rayon = "1"
+futures = "0.3"
+tiny_http = "0.12.0"
+socket2 = "0.6.5"
+minisign-verify = "0.3.0"
+semver = "1.0.28"
+fs2 = "0.4.3"
+
+# Debug builds: optimize dependencies (hashing, zip, http) but keep our
+# own code debuggable. Without this, SHA-512 runs ~50x slower in `tauri dev`.
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+filetime = "0.2.29"
+minisign = "0.10.0"
