@@ -74,6 +74,9 @@ export default function App() {
   const [appVer, setAppVer] = useState("");
   // "Later" hides the banner for this state+version until it changes.
   const [updHidden, setUpdHidden] = useState("");
+  // Optimistic hide for the post-update welcome — ack clears it in the
+  // store, but don't make the user wait a poll cycle for it to vanish.
+  const [welcomeHidden, setWelcomeHidden] = useState("");
   const [updConfirm, setUpdConfirm] = useState(false);
   const [updHosting, setUpdHosting] = useState(false);
   const [updErr, setUpdErr] = useState("");
@@ -275,7 +278,7 @@ export default function App() {
         </div>
       </header>
 
-      {upd?.justUpdated && (
+      {upd?.justUpdated && welcomeHidden !== upd.justUpdated && (
         <div className="upd-bar upd-good">
           <span>
             ✓ updated to <b>v{upd.justUpdated}</b>
@@ -286,7 +289,14 @@ export default function App() {
           <button onClick={() => openReleaseNotes(upd.justUpdated)}>
             Learn more
           </button>
-          <button onClick={() => ackAppUpdate()}>Dismiss</button>
+          <button
+            onClick={() => {
+              setWelcomeHidden(upd.justUpdated);
+              ackAppUpdate().catch(() => setWelcomeHidden(""));
+            }}
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
