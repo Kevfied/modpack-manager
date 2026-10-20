@@ -105,8 +105,17 @@ export default function App() {
   const updKey = upd ? `${upd.state}:${upd.version}` : "";
   const updVisible = !!upd && upd.state !== "idle" && updHidden !== updKey;
 
+  // Poll-gated actions: hide instantly so the click feels immediate; the
+  // next poll brings the bar back in its new state (offer→skipped etc.).
+  // On failure, un-hide so the current state stays visible.
+  const updAction = (fn: () => Promise<unknown>) => {
+    setUpdHidden(updKey);
+    fn().catch(() => setUpdHidden(""));
+  };
+
   const onUpdateNow = async () => {
     setUpdErr("");
+    if (upd) setUpd({ ...upd, state: "downloading", progress: 0 });
     try {
       await downloadAppUpdate();
     } catch (e) {
@@ -315,7 +324,9 @@ export default function App() {
                 Read more
               </button>
               <button onClick={() => setUpdHidden(updKey)}>Later</button>
-              <button onClick={() => skipAppVersion(upd.version)}>Skip this version</button>
+              <button onClick={() => updAction(() => skipAppVersion(upd.version))}>
+                Skip this version
+              </button>
             </>
           )}
           {upd.state === "downloading" && (
@@ -326,7 +337,7 @@ export default function App() {
               <div className="upd-prog">
                 <div style={{ width: `${upd.progress * 100}%` }} />
               </div>
-              <button onClick={() => cancelAppUpdate()}>Cancel</button>
+              <button onClick={() => updAction(() => cancelAppUpdate())}>Cancel</button>
               <button onClick={() => setUpdHidden(updKey)}>Hide</button>
             </>
           )}
@@ -348,14 +359,14 @@ export default function App() {
               <span>
                 update <b>v{upd.version}</b> exists — waiting for a seeder…
               </span>
-              <button onClick={() => skipAppVersion(upd.version)}>Skip</button>
+              <button onClick={() => updAction(() => skipAppVersion(upd.version))}>Skip</button>
               <button onClick={() => setUpdHidden(updKey)}>Hide</button>
             </>
           )}
           {upd.state === "skipped" && (
             <>
               <span className="dim">update v{upd.version} skipped</span>
-              <button onClick={() => unskipAppVersion()}>Reconsider</button>
+              <button onClick={() => updAction(() => unskipAppVersion())}>Reconsider</button>
               <button onClick={() => setUpdHidden(updKey)}>Hide</button>
             </>
           )}
