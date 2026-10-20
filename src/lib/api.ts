@@ -290,6 +290,10 @@ export interface AppUpdateStatus {
   source: string; // machine name of the seeder
   progress: number; // 0..1
   runningVersion: string;
+  /** New version while a post-update "updated" banner awaits dismissal. */
+  justUpdated: string;
+  /** Release notes captured at install time for the justUpdated banner. */
+  updatedNotes: string;
 }
 
 export const appUpdateStatus = () =>
@@ -301,6 +305,13 @@ export const downloadAppUpdate = () =>
 export const cancelAppUpdate = () => invoke<void>("cancel_app_update");
 
 export const installAppUpdate = () => invoke<string>("install_app_update");
+
+/** Dismiss the post-update "updated" banner permanently. */
+export const ackAppUpdate = () => invoke<void>("ack_app_update");
+
+/** Open a release's GitHub page in the default browser. */
+export const openReleaseNotes = (version: string) =>
+  invoke<void>("open_release_notes", { version });
 
 export const skipAppVersion = (version: string) =>
   invoke<void>("skip_app_version", { version });

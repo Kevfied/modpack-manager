@@ -249,6 +249,15 @@ td.dim, .dim { color: var(--text-dim); }
   flex-wrap: wrap;
 }
 .upd-bar b { color: var(--text); }
+.upd-good { border-left: 2px solid var(--text); }
+.upd-notes {
+  display: block;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 480px;
+}
 .upd-prog {
   flex: 0 0 120px;
   height: 6px;

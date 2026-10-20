@@ -473,6 +473,32 @@ fn install_app_update(app: tauri::AppHandle) -> Result<String, String> {
     Ok(msg)
 }
 
+/// Dismiss the post-update "✓ updated" banner permanently.
+#[tauri::command]
+fn ack_app_update() {
+    appupdate::ack_update_banner(&update_app_dir());
+}
+
+/// Open the GitHub release page for a version in the default browser.
+#[tauri::command]
+fn open_release_notes(version: String) -> Result<(), String> {
+    // Strict charset — this string lands inside a URL.
+    if version.is_empty()
+        || version.len() > 32
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return Err("bad version".into());
+    }
+    let url = format!("https://github.com/Kevfied/modpack-manager/releases/tag/v{version}");
+    std::process::Command::new("explorer.exe")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn skip_app_version(version: String) {
     appupdate::skip_version(&update_app_dir(), &version);
@@ -635,6 +661,8 @@ pub fn run() {
             download_app_update,
             cancel_app_update,
             install_app_update,
+            ack_app_update,
+            open_release_notes,
             skip_app_version,
             unskip_app_version,
             pick_update_bundle,

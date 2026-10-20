@@ -3,12 +3,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ackAppUpdate,
   appUpdateStatus,
   cancelAppUpdate,
   compatReport,
   connectStatus,
   downloadAppUpdate,
   installAppUpdate,
+  openReleaseNotes,
   resolveMods,
   scanFiles,
   scanFolder,
@@ -273,6 +275,21 @@ export default function App() {
         </div>
       </header>
 
+      {upd?.justUpdated && (
+        <div className="upd-bar upd-good">
+          <span>
+            ✓ updated to <b>v{upd.justUpdated}</b>
+            {upd.updatedNotes && (
+              <span className="dim upd-notes">{upd.updatedNotes}</span>
+            )}
+          </span>
+          <button onClick={() => openReleaseNotes(upd.justUpdated)}>
+            Learn more
+          </button>
+          <button onClick={() => ackAppUpdate()}>Dismiss</button>
+        </div>
+      )}
+
       {updVisible && upd && (
         <div className="upd-bar">
           {upd.state === "offer" && (
@@ -281,8 +298,12 @@ export default function App() {
                 ▲ update <b>v{upd.version}</b> available
                 {upd.size > 0 && <> ({(upd.size / 1048576).toFixed(1)} MB)</>}
                 {upd.source && <span className="dim"> from {upd.source}</span>}
+                {upd.notes && <span className="dim upd-notes">{upd.notes}</span>}
               </span>
               <button onClick={onUpdateNow}>Update now</button>
+              <button onClick={() => openReleaseNotes(upd.version)}>
+                Read more
+              </button>
               <button onClick={() => setUpdHidden(updKey)}>Later</button>
               <button onClick={() => skipAppVersion(upd.version)}>Skip this version</button>
             </>
@@ -303,8 +324,12 @@ export default function App() {
             <>
               <span>
                 update <b>v{upd.version}</b> verified — ready to install
+                {upd.notes && <span className="dim upd-notes">{upd.notes}</span>}
               </span>
               <button onClick={onInstall}>Restart &amp; install</button>
+              <button onClick={() => openReleaseNotes(upd.version)}>
+                Read more
+              </button>
               <button onClick={() => setUpdHidden(updKey)}>Later</button>
             </>
           )}

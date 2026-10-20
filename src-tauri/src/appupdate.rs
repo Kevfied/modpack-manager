@@ -73,6 +73,12 @@ pub struct AppUpdateStatus {
     pub progress: f64,
     #[serde(rename = "runningVersion")]
     pub running_version: String,
+    /// Set while a "✓ updated" welcome is pending dismissal (the new version).
+    #[serde(rename = "justUpdated")]
+    pub just_updated: String,
+    /// Release notes captured at install time for the justUpdated banner.
+    #[serde(rename = "updatedNotes")]
+    pub updated_notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,6 +86,8 @@ struct DownloadedEntry {
     pub version: String,
     pub path: String,
     pub sha256: String,
+    #[serde(default)]
+    pub notes: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -89,6 +97,15 @@ struct AppUpdateStore {
     #[serde(rename = "knownVersion")]
     known_version: Option<String>,
     downloaded: Option<DownloadedEntry>,
+    /// Version the app was running at last status check — detects upgrades.
+    #[serde(default, rename = "lastRun")]
+    last_run: Option<String>,
+    /// New version awaiting the post-update banner's dismissal.
+    #[serde(default, rename = "welcomePending")]
+    welcome_pending: Option<String>,
+    /// Notes for the version most recently installed via the updater.
+    #[serde(default, rename = "installedNotes")]
+    installed_notes: String,
 }
 
 #[derive(Default)]
@@ -555,7 +572,22 @@ pub async fn app_update_status_pk(
     pubkey: &str,
 ) -> AppUpdateStatus {
     let running = running_version();
-    let store = load_store(dir);
+    let mut store = load_store(dir);
+    // Version changed since last run → a welcome banner is owed. Flagged
+    // persistently so it's emitted until the user dismisses it.
+    if store.last_run.as_deref() != Some(running.as_str()) {
+        if store.last_run.is_some() {
+            store.welcome_pending = Some(running.clone());
+        }
+        store.last_run = Some(running.clone());
+        save_store(dir, &store);
+    }
+    let just_updated = store.welcome_pending.clone().unwrap_or_default();
+    let updated_notes = if just_updated.is_empty() {
+        String::new()
+    } else {
+        store.installed_notes.clone()
+    };
     let base = |state: &str| AppUpdateStatus {
         state: state.into(),
         version: String::new(),
@@ -564,6 +596,8 @@ pub async fn app_update_status_pk(
         source: String::new(),
         progress: 0.0,
         running_version: running.clone(),
+        just_updated: just_updated.clone(),
+        updated_notes: updated_notes.clone(),
     };
 
     // Downloaded-and-verified bundle? Surfaces when nothing newer is being
@@ -575,7 +609,7 @@ pub async fn app_update_status_pk(
                 .map(|v| v > running_semver())
                 .unwrap_or(false)
             && sha256_file(&p).map(|h| h == d.sha256).unwrap_or(false);
-        ok.then(|| d.version.clone())
+        ok.then(|| (d.version.clone(), d.notes.clone()))
     });
 
     let (dl_running, dl_progress) = {
@@ -607,7 +641,7 @@ pub async fn app_update_status_pk(
         // An offer only displaces a staged download if it's strictly newer.
         let newer_than_dl = |bv: &str| -> bool {
             match (&downloaded_ver, semver::Version::parse(bv)) {
-                (Some(dv), Ok(bv)) => semver::Version::parse(dv)
+                (Some((dv, _)), Ok(bv)) => semver::Version::parse(dv)
                     .map(|d| bv > d)
                     .unwrap_or(false),
                 (None, _) => true,
@@ -657,9 +691,10 @@ pub async fn app_update_status_pk(
         }
     }
 
-    if let Some(dv) = downloaded_ver {
+    if let Some((dv, dnotes)) = downloaded_ver {
         let mut s = base("downloaded");
         s.version = dv;
+        s.notes = dnotes;
         s.progress = 1.0;
         return s;
     }
@@ -859,6 +894,7 @@ async fn try_download_from(
         version: m.version.clone(),
         path: final_path.to_string_lossy().into_owned(),
         sha256: m.sha256.clone(),
+        notes: m.notes.clone(),
     });
     s.known_version = Some(m.version.clone());
     save_store(dir, &s);
@@ -1037,6 +1073,15 @@ pub fn pick_update_bundle_pk(
 
 // ---------------------------------------------------------------- launch purge
 
+/// Dismiss the post-update "✓ updated" banner permanently.
+pub fn ack_update_banner(dir: &Path) {
+    let mut s = load_store(dir);
+    if s.welcome_pending.is_some() {
+        s.welcome_pending = None;
+        save_store(dir, &s);
+    }
+}
+
 /// Run once at startup: drop installed/superseded downloads, stale parts,
 /// orphan .tmp files, and seed bundles older than what we're running.
 /// Seed purges at strictly-older only — a just-updated instance keeps seeding
@@ -1050,6 +1095,17 @@ pub fn launch_purge(dir: &Path) {
             .map(|v| v <= running)
             .unwrap_or(true);
         if stale {
+            // A staged installer equal to what now runs = it was just
+            // installed via the updater — keep its notes and owe the
+            // "✓ updated" banner even without a prior last_run record.
+            if semver::Version::parse(&d.version).map(|v| v == running).unwrap_or(false) {
+                if !d.notes.is_empty() {
+                    s.installed_notes = d.notes.clone();
+                }
+                if s.welcome_pending.is_none() {
+                    s.welcome_pending = Some(d.version.clone());
+                }
+            }
             let _ = std::fs::remove_file(&d.path);
             s.downloaded = None;
             dirty = true;
