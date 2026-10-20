@@ -1,7 +1,7 @@
 [package]
 name = "app"
-version = "0.1.2"
-description = "Modpack Manager Ã¢â‚¬â€ Minecraft modpack builder"
+version = "0.1.3"
+description = "Modpack Manager ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Minecraft modpack builder"
 authors = ["you"]
 license = ""
 repository = ""

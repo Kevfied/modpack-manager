@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import {
   appUpdateStatus,
@@ -68,6 +69,7 @@ export default function App() {
 
   // ---- app update (LAN) ----
   const [upd, setUpd] = useState<AppUpdateStatus | null>(null);
+  const [appVer, setAppVer] = useState("");
   // "Later" hides the banner for this state+version until it changes.
   const [updHidden, setUpdHidden] = useState("");
   const [updConfirm, setUpdConfirm] = useState(false);
@@ -85,6 +87,7 @@ export default function App() {
       }
     };
     poll();
+    getVersion().then(setAppVer).catch(() => {});
     const t = setInterval(poll, 5000);
     const un = listen("appupdate-progress", poll);
     return () => {
@@ -397,6 +400,8 @@ export default function App() {
       <footer className="statusbar">
         <span>{status || "ready"}</span>
         {folder && <span className="dim mono">{folder}</span>}
+        <span style={{ flex: 1 }} />
+        {appVer && <span className="dim mono">v{appVer}</span>}
       </footer>
     </>
   );
