@@ -956,11 +956,31 @@ pub fn prepare_install(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Prepare + spawn the installer detached. The caller exits the app after.
+/// The installer runs SILENT (/S — no dialogs), then relaunches the updated
+/// app once it finishes, so an update is a single click end-to-end.
 pub fn install_app_update(dir: &Path) -> Result<String> {
     let p = prepare_install(dir)?;
-    std::process::Command::new(&p)
-        .spawn()
-        .context("failed to launch installer")?;
+    // Run via a .cmd so we can wait for the install to finish before relaunching
+    // the app. The 2s delay gives our process time to exit before NSIS starts —
+    // a running app would block the file swap or trigger a close prompt.
+    let script = dl_dir(dir).join("update.cmd");
+    let exe = std::env::current_exe()
+        .map(|e| e.display().to_string())
+        .unwrap_or_default();
+    let body = format!(
+        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\n\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
+        p.display(),
+        exe
+    );
+    std::fs::write(&script, body).context("failed to write update.cmd")?;
+    let mut cmd = std::process::Command::new("cmd.exe");
+    cmd.args(["/c", &script.display().to_string()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — no console flash
+    }
+    cmd.spawn().context("failed to launch installer")?;
     Ok(format!("installing {}", p.display()))
 }
 
