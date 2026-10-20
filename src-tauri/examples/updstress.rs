@@ -651,13 +651,30 @@ fn main() {
 
         // ================================================================
         println!("== install & misc ==");
-        // install_app_update on a fake exe → spawn fails cleanly (not a PE).
+        // install_app_update writes update.cmd + launches the detached helper.
+        // The helper (cmd.exe) always spawns; a bogus payload can't reach this
+        // point because the manifest hash binds the file at download time.
         let r = appupdate::install_app_update(&hdl);
-        check(r.is_err(), "installer spawn failure returns error, no panic");
+        check(r.is_ok(), "install_app_update launches helper");
+        let cmd_path = hdl.join("updates-dl").join("update.cmd");
+        let cmd_body = std::fs::read_to_string(&cmd_path).unwrap_or_default();
+        check(
+            cmd_body.contains("/S") && cmd_body.contains("start"),
+            "update.cmd runs installer silently then relaunches",
+        );
         // prepare_install is idempotent.
         let p1 = appupdate::prepare_install(&hdl);
         let p2 = appupdate::prepare_install(&hdl);
         check(p1.is_ok() && p2.is_ok(), "prepare_install idempotent");
+        // Corrupting the staged payload fails the install-time hash check.
+        let pp = p1.as_ref().unwrap().clone();
+        let good = std::fs::read(&pp).unwrap();
+        std::fs::write(&pp, b"corrupt").unwrap();
+        check(
+            appupdate::install_app_update(&hdl).is_err(),
+            "corrupt staged payload rejected at install",
+        );
+        std::fs::write(&pp, &good).unwrap();
         // ensure_server double-call → still serving, no crash.
         check(sync::ensure_server(&hs) && sync::server_running(), "ensure_server idempotent");
         // Progress callback reported sane values during the big download.

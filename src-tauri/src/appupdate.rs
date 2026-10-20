@@ -968,7 +968,7 @@ pub fn install_app_update(dir: &Path) -> Result<String> {
         .map(|e| e.display().to_string())
         .unwrap_or_default();
     let body = format!(
-        "@echo off\r\ntimeout /t 2 /nobreak >nul\r\n\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
+        "@echo off\r\n\"%SystemRoot%\\System32\\timeout.exe\" /t 2 /nobreak >nul\r\n\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
         p.display(),
         exe
     );
