@@ -435,6 +435,14 @@ fn machine_name() -> String {
 }
 
 /// Passive listener for MMPKAPP announces — always safe to run.
+/// Fired when a seeder announce reveals something new — a new seeder or a
+/// version bump — so the UI can re-check instantly rather than on its poll.
+static SEED_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+pub fn set_seed_hook(f: impl Fn() + Send + Sync + 'static) {
+    let _ = SEED_HOOK.set(Box::new(f));
+}
+
 pub fn start_update_listener() {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::Relaxed) {
@@ -477,7 +485,18 @@ pub fn start_update_listener() {
                 seen: now_secs(),
             };
             if !f.bundle_version.is_empty() {
-                found_map().lock().unwrap().insert(f.addr.clone(), f);
+                let mut m = found_map().lock().unwrap();
+                let changed = m
+                    .get(&f.addr)
+                    .map(|o| o.bundle_version != f.bundle_version)
+                    .unwrap_or(true);
+                m.insert(f.addr.clone(), f);
+                drop(m);
+                if changed {
+                    if let Some(h) = SEED_HOOK.get() {
+                        h();
+                    }
+                }
             }
         }
     });

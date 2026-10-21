@@ -45,9 +45,20 @@ export default function LoaderView(props: Props) {
   const pushLog = (line: string) =>
     setLog((l) => [...l, ...line.split("\n").filter(Boolean)]);
 
+  // Live lists — a Connect apply mid-session adds the synced pack here,
+  // a newly installed launcher appears too, without revisiting the tab.
   useEffect(() => {
-    detectLaunchers().then(setDetected).catch((e) => pushLog(`x detection failed: ${e}`));
-    listSyncedPacks().then(setSynced).catch(() => {});
+    const load = (first: boolean) => {
+      detectLaunchers()
+        .then(setDetected)
+        .catch((e) => {
+          if (first) pushLog(`x detection failed: ${e}`);
+        });
+      listSyncedPacks().then(setSynced).catch(() => {});
+    };
+    load(true);
+    const t = window.setInterval(() => load(false), 4000);
+    return () => window.clearInterval(t);
   }, []);
 
   const makeConfig = (): PackConfig => ({

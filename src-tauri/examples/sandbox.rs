@@ -568,6 +568,24 @@ fn main() {
             launchers::pack_instance_exists(&prism, &packs[0].name),
             "overwrite detection sees the new instance",
         );
+        // Stale jars in the managed instance get mirror-deleted on reload.
+        let inst = prism_dir
+            .join("instances")
+            .join(&packs[0].name.to_lowercase().replace(' ', "-"));
+        let stale = inst.join(".minecraft/mods/stale-old.jar");
+        std::fs::write(&stale, b"stale").unwrap();
+        let notajar = inst.join(".minecraft/mods/note.txt");
+        std::fs::write(&notajar, b"keep me").unwrap();
+        let l2 = sync::load_synced_pack(&mr_client, &inst_root, &packs[0].network_id, &prism)
+            .await
+            .unwrap();
+        println!("{l2}");
+        check(!stale.exists(), "stale jar mirror-deleted on reinstall");
+        check(notajar.exists(), "non-jar file in mods dir untouched");
+        check(
+            inst.join(".minecraft/mods/alpha.jar").is_file(),
+            "pack jar still present after mirror",
+        );
         let _ = vanilla; // vanilla path needs a real .minecraft — covered by packtest
     });
 
@@ -592,6 +610,17 @@ fn main() {
             serde_json::from_str(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
         check(store["host"].is_null(), "host_stop cleared saved host state");
     }
+
+    // ---- 12b. leaving clears the synced mirror from disk ----
+    println!("== leave cleans synced dir ==");
+    let leftover = { cs.lock().unwrap().as_ref().unwrap().synced_dir.clone() };
+    check(leftover.join("pack.json").is_file(), "synced dir exists pre-leave");
+    sync::leave_network(&cs, &store_path);
+    check(
+        !leftover.exists(),
+        "leave_network removed the synced mirror dir",
+    );
+    check(cs.lock().unwrap().is_none(), "client session cleared on leave");
 
     // ---- 13. core app features (deterministic) ----
     rt.block_on(async {

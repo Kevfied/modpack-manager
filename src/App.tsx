@@ -95,10 +95,14 @@ export default function App() {
     getVersion().then(setAppVer).catch(() => {});
     const t = setInterval(poll, 5000);
     const un = listen("appupdate-progress", poll);
+    // A seeder announce (new or version-bumped) re-checks instantly —
+    // the offer shows within a second of a peer publishing.
+    const un2 = listen("appupdate-offer", poll);
     return () => {
       alive = false;
       clearInterval(t);
       un.then((f) => f());
+      un2.then((f) => f());
     };
   }, []);
 

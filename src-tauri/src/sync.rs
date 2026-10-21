@@ -1030,6 +1030,15 @@ fn found_map() -> &'static Mutex<HashMap<String, FoundNetwork>> {
     FOUND.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Fired when an announce reveals something new — a new network, a version
+/// bump, a changed addr or member count. Lets the UI refresh instantly
+/// instead of waiting for its next poll.
+static FOUND_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+pub fn set_found_hook(f: impl Fn() + Send + Sync + 'static) {
+    let _ = FOUND_HOOK.set(Box::new(f));
+}
+
 /// Start the UDP announce listener once per process.
 pub fn start_discovery_listener() {
     static STARTED: AtomicBool = AtomicBool::new(false);
@@ -1078,17 +1087,22 @@ pub fn start_discovery_listener() {
             };
             if !f.network_id.is_empty() {
                 let mut m = found_map().lock().unwrap();
-                let entry = m.entry(f.network_id.clone()).or_insert(FoundNetwork {
-                    network_id: f.network_id.clone(),
-                    name: String::new(),
-                    pack_name: String::new(),
-                    machine: String::new(),
-                    addr: String::new(),
-                    latest_version: 0,
-                    members: 0,
-                    app_version: String::new(),
-                });
-                *entry = f;
+                let changed = match m.get(&f.network_id) {
+                    Some(o) => {
+                        o.latest_version != f.latest_version
+                            || o.addr != f.addr
+                            || o.name != f.name
+                            || o.members != f.members
+                    }
+                    None => true,
+                };
+                m.insert(f.network_id.clone(), f);
+                drop(m);
+                if changed {
+                    if let Some(h) = FOUND_HOOK.get() {
+                        h();
+                    }
+                }
             }
         }
     });
@@ -1265,7 +1279,12 @@ fn spawn_heartbeat(cs: SharedClient) {
 }
 
 pub fn leave_network(cs: &SharedClient, store_path: &Path) {
-    *cs.lock().unwrap() = None;
+    // Take the session and drop its synced mirror — everything in it is
+    // re-downloadable, so leaving shouldn't leave a dead copy on disk.
+    let dir = cs.lock().unwrap().take().map(|c| c.synced_dir);
+    if let Some(d) = dir {
+        let _ = std::fs::remove_dir_all(&d);
+    }
     clear_saved_client(store_path);
 }
 
@@ -1569,9 +1588,14 @@ pub fn list_synced_packs(root: &Path) -> Vec<SyncedPackInfo> {
     out
 }
 
-fn copy_jars(src_dir: &Path, dest_mods: &Path) -> Result<usize> {
+/// Mirror jars src→dest (flattened by filename), then remove any dest
+/// jars the source no longer has — a pack instance we manage should match
+/// the pack, not accumulate jars the host removed. Non-jar files and
+/// subdirs in dest are left alone. Returns (copied, removed).
+fn sync_jars(src_dir: &Path, dest_mods: &Path) -> Result<(usize, usize)> {
     std::fs::create_dir_all(dest_mods)?;
     let mut count = 0usize;
+    let mut want = HashSet::new();
     let mut stack = vec![src_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d)?.flatten() {
@@ -1579,17 +1603,32 @@ fn copy_jars(src_dir: &Path, dest_mods: &Path) -> Result<usize> {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().map(|x| x == "jar").unwrap_or(false) {
-                let dest = dest_mods.join(
-                    p.file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                );
-                std::fs::copy(&p, &dest)?;
+                let name = p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                want.insert(name.clone());
+                std::fs::copy(&p, dest_mods.join(&name))?;
                 count += 1;
             }
         }
     }
-    Ok(count)
+    let mut removed = 0usize;
+    if let Ok(rd) = std::fs::read_dir(dest_mods) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_jar = p.is_file() && p.extension().map(|x| x == "jar").unwrap_or(false);
+            let in_pack = p
+                .file_name()
+                .map(|f| want.contains(&f.to_string_lossy().into_owned()))
+                .unwrap_or(false);
+            if is_jar && !in_pack {
+                let _ = std::fs::remove_file(&p);
+                removed += 1;
+            }
+        }
+    }
+    Ok((count, removed))
 }
 
 /// Load a synced pack into a launcher (copy jars + loader + profile/instance).
@@ -1623,7 +1662,10 @@ pub async fn load_synced_pack(
             let id = pack::slugify(&cfg.name);
             let inst = Path::new(dd).join("instances").join(&id);
             let gamedir = inst.join(".minecraft");
-            let n = copy_jars(&mods_dir, &gamedir.join("mods"))?;
+            let (n, removed) = sync_jars(&mods_dir, &gamedir.join("mods"))?;
+            if removed > 0 {
+                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
+            }
             std::fs::write(
                 inst.join("instance.cfg"),
                 format!("InstanceType=OneSix\nname={}\nicon=default\n", cfg.name),
@@ -1647,8 +1689,11 @@ pub async fn load_synced_pack(
         _ => {
             let mc = launchers::minecraft_dir().context(".minecraft not found")?;
             let instance = root.join(pack::slugify(&cfg.name));
-            let n = copy_jars(&mods_dir, &instance.join("mods"))?;
+            let (n, removed) = sync_jars(&mods_dir, &instance.join("mods"))?;
             log.push_str(&format!("✓ staged {n} mod(s)\n"));
+            if removed > 0 {
+                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
+            }
             let version_id =
                 launchers::ensure_loader_version(client, &mc, &cfg, &mut log).await?;
             launchers::add_launcher_profile(&mc, &cfg.name, &version_id, &instance)?;

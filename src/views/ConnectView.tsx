@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import {
   applyUpdate,
   connectStatus,
@@ -82,24 +83,35 @@ export default function ConnectView(props: Props) {
   useEffect(() => {
     refresh();
     timer.current = window.setInterval(refresh, 4000);
+    // A network announce (new network, version bump, member change)
+    // refreshes instantly — found networks and pending updates appear
+    // the moment the host publishes, not on the next poll.
+    const un = listen("networks-found", refresh);
     return () => {
       if (timer.current) window.clearInterval(timer.current);
+      un.then((f) => f());
     };
   }, [refresh]);
 
   // Once a pack is applied, fetch the launcher list + pack meta so the
-  // member can load it straight into their launcher from this tab.
+  // member can load it straight into their launcher from this tab —
+  // and keep them fresh so a newly installed launcher shows up live.
   const applied = status?.appliedVersion ?? 0;
   const joined = status?.mode === "joined";
   const nid = status?.networkId ?? null;
   useEffect(() => {
     if (!joined || applied === 0) return;
-    detectLaunchers()
-      .then((d) => setLaunchers(d.launchers))
-      .catch((e) => pushLog(`x launcher detection: ${e}`));
-    listSyncedPacks()
-      .then((packs) => setSyncedPack(packs.find((p) => p.networkId === nid) ?? null))
-      .catch(() => {});
+    const load = () => {
+      detectLaunchers()
+        .then((d) => setLaunchers(d.launchers))
+        .catch((e) => pushLog(`x launcher detection: ${e}`));
+      listSyncedPacks()
+        .then((packs) => setSyncedPack(packs.find((p) => p.networkId === nid) ?? null))
+        .catch(() => {});
+    };
+    load();
+    const t = window.setInterval(load, 5000);
+    return () => window.clearInterval(t);
   }, [joined, applied, nid]);
 
   const loadSyncedInto = async (l: LauncherInfo) => {

@@ -623,6 +623,17 @@ pub fn run() {
             appupdate::start_update_listener();
             let st = app.state::<AppState>();
             appupdate::start_update_announcer(st.host.clone(), dir);
+            // Discovery hooks → UI events, so new networks/seeders appear
+            // instantly instead of on the next poll tick.
+            use tauri::Emitter;
+            let h = app.handle().clone();
+            sync::set_found_hook(move || {
+                let _ = h.emit("networks-found", ());
+            });
+            let h = app.handle().clone();
+            appupdate::set_seed_hook(move || {
+                let _ = h.emit("appupdate-offer", ());
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
