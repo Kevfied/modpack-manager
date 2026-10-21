@@ -1505,7 +1505,10 @@ pub async fn apply_update(
             return Ok(log);
         }
     }
-    log.push_str(&format!("✓ synced to v{} — find it in Loader", manifest.version));
+    log.push_str(&format!(
+        "✓ synced to v{} — pick a launcher below to install it",
+        manifest.version
+    ));
     Ok(log)
 }
 

@@ -4,6 +4,7 @@ import {
   applyUpdate,
   connectStatus,
   declineUpdate,
+  detectLaunchers,
   hostKick,
   hostPublish,
   hostSetFolder,
@@ -12,9 +13,18 @@ import {
   hostUpdate,
   joinNetwork,
   leaveNetwork,
+  listSyncedPacks,
+  loadSyncedPack,
+  packExists,
   scanNetworks,
 } from "../lib/api";
-import type { ConnectStatus, FoundNetwork, PackSettings } from "../lib/api";
+import type {
+  ConnectStatus,
+  FoundNetwork,
+  LauncherInfo,
+  PackSettings,
+  SyncedPackInfo,
+} from "../lib/api";
 
 interface Props {
   settings: PackSettings;
@@ -44,6 +54,9 @@ export default function ConnectView(props: Props) {
   const [joinAddr, setJoinAddr] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [displayName, setDisplayName] = useState(savedName());
+  // post-apply: launcher picker + synced pack meta
+  const [launchers, setLaunchers] = useState<LauncherInfo[]>([]);
+  const [syncedPack, setSyncedPack] = useState<SyncedPackInfo | null>(null);
   const timer = useRef<number | null>(null);
 
   const pushLog = (line: string) =>
@@ -73,6 +86,44 @@ export default function ConnectView(props: Props) {
       if (timer.current) window.clearInterval(timer.current);
     };
   }, [refresh]);
+
+  // Once a pack is applied, fetch the launcher list + pack meta so the
+  // member can load it straight into their launcher from this tab.
+  const applied = status?.appliedVersion ?? 0;
+  const joined = status?.mode === "joined";
+  const nid = status?.networkId ?? null;
+  useEffect(() => {
+    if (!joined || applied === 0) return;
+    detectLaunchers()
+      .then((d) => setLaunchers(d.launchers))
+      .catch((e) => pushLog(`x launcher detection: ${e}`));
+    listSyncedPacks()
+      .then((packs) => setSyncedPack(packs.find((p) => p.networkId === nid) ?? null))
+      .catch(() => {});
+  }, [joined, applied, nid]);
+
+  const loadSyncedInto = async (l: LauncherInfo) => {
+    if (!nid) return;
+    const name = syncedPack?.name || status?.networkName || "Synced Pack";
+    if (
+      (await packExists(l, name)) &&
+      !(await confirm(
+        `A pack named "${name}" already exists in ${l.name}.\nOverwrite it?`,
+        { title: "Pack exists", kind: "warning", okLabel: "Overwrite", cancelLabel: "Cancel" }
+      ))
+    ) {
+      return;
+    }
+    setBusy(true);
+    pushLog(`> ${l.name}: installing "${name}" v${applied}…`);
+    try {
+      pushLog(await loadSyncedPack(nid, l));
+    } catch (e) {
+      pushLog(`x ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const pickFolder = async () => {
     const dir = await open({ directory: true, title: "Pick the mods folder to share" });
@@ -463,6 +514,35 @@ export default function ConnectView(props: Props) {
             </button>
           </div>
         </div>
+        {status.appliedVersion > 0 && (
+          <div className="panel">
+            <h3>Load into Minecraft</h3>
+            {launchers.length === 0 ? (
+              <div className="dim">
+                Pack is synced — but no launcher was detected. Install
+                Minecraft, TLauncher or Prism, or use the Loader tab.
+              </div>
+            ) : (
+              <>
+                <div className="dim" style={{ marginBottom: 8 }}>
+                  Pack synced (v{status.appliedVersion}) — pick a launcher to
+                  install it into:
+                </div>
+                {launchers.map((l) => (
+                  <button
+                    key={l.kind}
+                    className="primary"
+                    style={{ marginRight: 8, marginBottom: 6 }}
+                    disabled={busy}
+                    onClick={() => loadSyncedInto(l)}
+                  >
+                    {l.name}
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        )}
         <div className="panel">
           <h3>Members</h3>
           {membersTable(false) ?? <div className="dim">No member data yet.</div>}
