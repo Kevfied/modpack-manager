@@ -421,7 +421,9 @@ pub fn start_update_announcer(hs: sync::SharedHost, app_dir: PathBuf) {
                 "machine": machine_name(),
             })
             .to_string();
-            let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", sync::BROADCAST_PORT));
+            for b in sync::broadcast_targets() {
+                let _ = sock.send_to(msg.as_bytes(), (b, sync::BROADCAST_PORT));
+            }
         }
     });
 }

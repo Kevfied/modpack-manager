@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -962,6 +962,30 @@ fn rand_u64() -> u64 {
 
 // ---- udp announce ----
 
+/// Every broadcast target we should announce on: the global limited
+/// broadcast plus each up interface's directed broadcast. On multi-adapter
+/// hosts (Ethernet + Radmin/ZeroTier/Hamachi), the OS picks ONE interface
+/// for 255.255.255.255 — often the wrong one — so VPN peers never see the
+/// announce. Directed broadcasts force a copy onto every adapter.
+pub fn broadcast_targets() -> Vec<Ipv4Addr> {
+    let mut out = vec![Ipv4Addr::BROADCAST];
+    if let Ok(ifs) = if_addrs::get_if_addrs() {
+        for i in ifs {
+            let if_addrs::IfAddr::V4(ref v4) = i.addr else { continue };
+            if i.is_loopback() || v4.ip.is_link_local() {
+                continue;
+            }
+            let b = v4
+                .broadcast
+                .unwrap_or_else(|| v4.ip | !v4.netmask);
+            if !b.is_unspecified() && !b.is_broadcast() && !out.contains(&b) {
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
 fn announce_loop(hs: SharedHost) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -992,7 +1016,9 @@ fn announce_loop(hs: SharedHost) {
         })
         .to_string();
         drop(g);
-        let _ = sock.send_to(msg.as_bytes(), ("255.255.255.255", BROADCAST_PORT));
+        for b in broadcast_targets() {
+            let _ = sock.send_to(msg.as_bytes(), (b, BROADCAST_PORT));
+        }
     }
 }
 

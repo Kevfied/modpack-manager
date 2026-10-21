@@ -39,6 +39,7 @@ socket2 = "0.6.5"
 minisign-verify = "0.3.0"
 semver = "1.0.28"
 fs2 = "0.4.3"
+if-addrs = "0.15.0"
 
 # Debug builds: optimize dependencies (hashing, zip, http) but keep our
 # own code debuggable. Without this, SHA-512 runs ~50x slower in `tauri dev`.
