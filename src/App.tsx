@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -81,12 +81,25 @@ export default function App() {
   const [updHosting, setUpdHosting] = useState(false);
   const [updErr, setUpdErr] = useState("");
 
+  // While a download request is in flight, ignore stale "offer" poll
+  // results — an in-flight poll from before the click would otherwise
+  // snap the bar back to "Update now" until the next tick.
+  const dlRequested = useRef("");
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       try {
         const s = await appUpdateStatus();
-        if (alive) setUpd(s);
+        if (!alive) return;
+        if (
+          dlRequested.current &&
+          s.state === "offer" &&
+          s.version === dlRequested.current
+        ) {
+          return; // stale pre-click result — keep the downloading view
+        }
+        if (s.state !== "offer") dlRequested.current = "";
+        setUpd(s);
       } catch {
         /* backend not ready */
       }
@@ -119,10 +132,14 @@ export default function App() {
 
   const onUpdateNow = async () => {
     setUpdErr("");
-    if (upd) setUpd({ ...upd, state: "downloading", progress: 0 });
+    if (upd) {
+      dlRequested.current = upd.version;
+      setUpd({ ...upd, state: "downloading", progress: 0 });
+    }
     try {
       await downloadAppUpdate();
     } catch (e) {
+      dlRequested.current = "";
       setUpdErr(String(e));
     }
   };
