@@ -394,11 +394,24 @@ async fn connect_status(state: tauri::State<'_, AppState>) -> Result<sync::Conne
 }
 
 #[tauri::command]
-async fn apply_update(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    sync::apply_update(
+async fn apply_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    sync::apply_update_progress(
         &state.sync_client,
         state.client.inner_http(),
         &sync::store_path(),
+        move |i, total, name, done_b, total_b| {
+            let _ = app.emit(
+                "connect-apply-progress",
+                serde_json::json!({
+                    "done": i, "total": total, "name": name,
+                    "doneBytes": done_b, "totalBytes": total_b
+                }),
+            );
+        },
     )
     .await
     .map_err(|e| e.to_string())

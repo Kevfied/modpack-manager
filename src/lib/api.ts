@@ -271,6 +271,15 @@ export const connectStatus = () => invoke<ConnectStatus>("connect_status");
 
 export const applyUpdate = () => invoke<string>("apply_update");
 
+/** Live payload of the "connect-apply-progress" event during apply. */
+export interface ApplyProgress {
+  done: number;      // files finished
+  total: number;     // files queued
+  name: string;      // current file (relative path)
+  doneBytes: number; // bytes received for the current file
+  totalBytes: number;
+}
+
 export const declineUpdate = (version: number) =>
   invoke<void>("decline_update", { version });
 

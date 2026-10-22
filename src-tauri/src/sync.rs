@@ -559,11 +559,22 @@ pub fn host_publish(
     target: Option<u64>,
     allow_empty: bool,
 ) -> Result<String> {
-    let mut g = hs.lock().unwrap();
-    let h = g.as_mut().context("not hosting")?;
-    let files = build_file_list(&h.folder)?;
+    // Hash outside the lock — build_file_list sha1s every file, and holding
+    // the mutex across it stalled heartbeats/manifests for the duration.
+    let folder = {
+        let g = hs.lock().unwrap();
+        g.as_ref().context("not hosting")?.folder.clone()
+    };
+    let files = build_file_list(&folder)?;
     if files.is_empty() && !allow_empty {
         anyhow::bail!("EMPTY_PACK");
+    }
+    let mut g = hs.lock().unwrap();
+    let h = g.as_mut().context("not hosting")?;
+    // The share folder can't move underneath a publish — that would ship the
+    // stale listing under the new folder's name.
+    if h.folder != folder {
+        anyhow::bail!("folder changed during publish — try again");
     }
     // No-change guard: for a targeted publish, only compare against that
     // member's previous target — republishing the global content TO a member
@@ -858,11 +869,18 @@ fn handle_request(hs: &SharedHost, mut req: tiny_http::Request) {
                 .find_map(|kv| kv.strip_prefix("path="))
                 .map(url_decode)
                 .unwrap_or_default();
-            let g = hs.lock().unwrap();
-            let Some(h) = g.as_ref() else {
-                return respond_json(req, 404, &serde_json::json!({"error": "gone"}));
+            // The lock is only needed to read the share folder — req.respond
+            // streams the whole file, and holding the mutex across it stalled
+            // every heartbeat/manifest for the duration of each transfer
+            // (members flapped "host offline" while applying large packs).
+            let folder = {
+                let g = hs.lock().unwrap();
+                match g.as_ref() {
+                    None => return respond_json(req, 404, &serde_json::json!({"error": "gone"})),
+                    Some(h) => h.folder.clone(),
+                }
             };
-            let Some(dest) = safe_rel(&h.folder, &rel) else {
+            let Some(dest) = safe_rel(&folder, &rel) else {
                 return respond_json(req, 400, &serde_json::json!({"error": "bad path"}));
             };
             match std::fs::File::open(&dest) {
@@ -1393,6 +1411,17 @@ pub async fn apply_update(
     http: &reqwest::Client,
     store_path: &Path,
 ) -> Result<String> {
+    apply_update_progress(cs, http, store_path, |_, _, _, _, _| {}).await
+}
+
+/// Same, with live progress: `(file idx, total files, rel path, bytes done,
+/// bytes total)` per chunk — the UI shows a real bar instead of looking frozen.
+pub async fn apply_update_progress(
+    cs: &SharedClient,
+    http: &reqwest::Client,
+    store_path: &Path,
+    progress: impl Fn(usize, usize, &str, u64, u64),
+) -> Result<String> {
     let (addr, code, mid, dir, nid) = {
         let mut g = cs.lock().unwrap();
         let c = g.as_mut().context("not joined to a network")?;
@@ -1422,6 +1451,10 @@ pub async fn apply_update(
     let mut log = String::new();
     let mut downloaded = 0usize;
 
+    // Queue the files needing download up-front so progress has a total,
+    // then stream each straight to .part in chunks — memory stays flat on
+    // big jars and the UI gets per-chunk byte progress.
+    let mut queue: Vec<&ManifestFile> = Vec::new();
     for f in &manifest.files {
         let Some(local) = safe_rel(&mods_dir, &f.path) else { continue };
         let ok = local
@@ -1430,14 +1463,19 @@ pub async fn apply_update(
             .flatten()
             .map(|h| h == f.sha1)
             .unwrap_or(false);
-        if ok {
-            continue;
+        if !ok {
+            queue.push(f);
         }
+    }
+    let total_files = queue.len();
+
+    for (i, f) in queue.iter().enumerate() {
+        let Some(local) = safe_rel(&mods_dir, &f.path) else { continue };
         let tmp = local.with_extension("part");
         if let Some(p) = tmp.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let bytes = http
+        let mut resp = http
             .get(format!(
                 "http://{addr}/file?path={}",
                 url_encode(&f.path)
@@ -1448,18 +1486,27 @@ pub async fn apply_update(
             .send()
             .await
             .context("download failed")?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        let got = hex::encode(sha1::Sha1::digest(&bytes));
-        if got != f.sha1 {
+            .error_for_status()?;
+        let total_b = resp.content_length().unwrap_or(0);
+        let mut tmpf = std::fs::File::create(&tmp)?;
+        let mut hasher = sha1::Sha1::new();
+        let mut got_b = 0u64;
+        progress(i, total_files, &f.path, 0, total_b);
+        while let Some(chunk) = resp.chunk().await.context("download interrupted")? {
+            std::io::Write::write_all(&mut tmpf, &chunk)?;
+            hasher.update(&chunk);
+            got_b += chunk.len() as u64;
+            progress(i, total_files, &f.path, got_b, total_b);
+        }
+        drop(tmpf);
+        if hex::encode(hasher.finalize()) != f.sha1 {
             let _ = std::fs::remove_file(&tmp);
             log.push_str(&format!("! hash mismatch on {}, skipped\n", f.path));
             continue;
         }
-        std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &local)?;
         downloaded += 1;
+        progress(i + 1, total_files, &f.path, total_b, total_b);
     }
     log.push_str(&format!("✓ downloaded {} file(s)\n", downloaded));
 

@@ -20,6 +20,7 @@ import {
   scanNetworks,
 } from "../lib/api";
 import type {
+  ApplyProgress,
   ConnectStatus,
   FoundNetwork,
   LauncherInfo,
@@ -58,7 +59,16 @@ export default function ConnectView(props: Props) {
   // post-apply: launcher picker + synced pack meta
   const [launchers, setLaunchers] = useState<LauncherInfo[]>([]);
   const [syncedPack, setSyncedPack] = useState<SyncedPackInfo | null>(null);
+  // live download progress while apply_update streams files
+  const [applyProg, setApplyProg] = useState<ApplyProgress | null>(null);
   const timer = useRef<number | null>(null);
+  // Mirror of `busy` for the interval callback — while apply/publish runs,
+  // connectStatus polls would re-hash every synced file (diff_manifest)
+  // and compete with the download.
+  const busyRef = useRef(false);
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
 
   const pushLog = (line: string) =>
     setLog((l) => [...l, ...line.split("\n").filter(Boolean)]);
@@ -90,14 +100,20 @@ export default function ConnectView(props: Props) {
 
   useEffect(() => {
     refresh();
-    timer.current = window.setInterval(refresh, 4000);
+    timer.current = window.setInterval(() => {
+      if (!busyRef.current) refresh();
+    }, 4000);
     // A network announce (new network, version bump, member change)
     // refreshes instantly — found networks and pending updates appear
     // the moment the host publishes, not on the next poll.
     const un = listen("networks-found", refresh);
+    const un2 = listen<ApplyProgress>("connect-apply-progress", (e) =>
+      setApplyProg(e.payload)
+    );
     return () => {
       if (timer.current) window.clearInterval(timer.current);
       un.then((f) => f());
+      un2.then((f) => f());
     };
   }, [refresh]);
 
@@ -275,12 +291,14 @@ export default function ConnectView(props: Props) {
 
   const doApply = async () => {
     setBusy(true);
+    setApplyProg(null);
     try {
       pushLog(await applyUpdate());
       await refresh();
     } catch (e) {
       pushLog(`x ${e}`);
     } finally {
+      setApplyProg(null);
       setBusy(false);
     }
   };
@@ -511,14 +529,34 @@ export default function ConnectView(props: Props) {
                 {status.pending.fileCount} file(s) · {status.pending.toDownload} to download
                 {status.pending.toDelete ? ` · ${status.pending.toDelete} to remove` : ""}
               </div>
-              <div style={{ marginTop: 8 }}>
-                <button className="primary" onClick={doApply} disabled={busy}>
-                  Apply update
-                </button>{" "}
-                <button onClick={() => doDecline(status.pending!.version)} disabled={busy}>
-                  Decline
-                </button>
-              </div>
+              {applyProg ? (
+                <div style={{ marginTop: 8 }}>
+                  <div className="dim">
+                    downloading {applyProg.done + 1 > applyProg.total ? applyProg.total : applyProg.done + 1}
+                    /{applyProg.total} — {applyProg.name}
+                    {applyProg.totalBytes > 0 &&
+                      ` · ${Math.round((applyProg.doneBytes / applyProg.totalBytes) * 100)}%`}
+                  </div>
+                  {applyProg.totalBytes > 0 && (
+                    <div className="upd-prog">
+                      <div
+                        style={{
+                          width: `${(applyProg.doneBytes / applyProg.totalBytes) * 100}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ marginTop: 8 }}>
+                  <button className="primary" onClick={doApply} disabled={busy}>
+                    {busy ? "Applying…" : "Apply update"}
+                  </button>{" "}
+                  <button onClick={() => doDecline(status.pending!.version)} disabled={busy}>
+                    Decline
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="dim">
