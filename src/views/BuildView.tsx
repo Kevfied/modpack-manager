@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   buildModlist,
@@ -26,7 +26,7 @@ interface Props {
   compat: CompatReport | null;
   folder: string | null;
   settings: PackSettings;
-  setSettings: (s: PackSettings) => void;
+  setSettings: React.Dispatch<React.SetStateAction<PackSettings>>;
 }
 
 const LOADERS = ["fabric", "forge", "neoforge", "quilt"];
@@ -34,7 +34,10 @@ const LOADERS = ["fabric", "forge", "neoforge", "quilt"];
 export default function BuildView(props: Props) {
   const { settings: cfg, setSettings: setCfg } = props;
   const { name, version, summary, mcVersion, loader, loaderVersion } = cfg;
-  const set = (patch: Partial<PackSettings>) => setCfg({ ...cfg, ...patch });
+  // Functional update — a delayed patch (e.g. an async loader-version pick)
+  // must not clobber edits typed while it was in flight.
+  const set = (patch: Partial<PackSettings>) =>
+    setCfg((prev) => ({ ...prev, ...patch }));
   const [mcVersions, setMcVersions] = useState<string[]>([]);
   const [loaderVersions, setLoaderVersions] = useState<string[]>([]);
   const [deps, setDeps] = useState<DependencyWarning[]>([]);
@@ -52,15 +55,30 @@ export default function BuildView(props: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Switching loader/MC fires a new fetch — a slower response for the OLD
+  // target must not overwrite the new one's version list (or its pick).
+  const lvSeq = useRef(0);
   useEffect(() => {
+    const seq = ++lvSeq.current;
     if (!mcVersion || !loader) return;
     getLoaderVersions(loader, mcVersion)
       .then((vs) => {
+        if (seq !== lvSeq.current) return;
         setLoaderVersions(vs);
         if (vs.length && !vs.includes(loaderVersion)) set({ loaderVersion: vs[0] });
       })
-      .catch(() => setLoaderVersions([]));
+      .catch(() => {
+        if (seq === lvSeq.current) setLoaderVersions([]);
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loader, mcVersion]);
+
+  // Results are per-target — drop them (and ignore in-flight ones) when
+  // the target changes so nothing labelled for the old MC lingers.
+  const updSeq = useRef(0);
+  useEffect(() => {
+    updSeq.current++;
+    setUpdates(null);
   }, [loader, mcVersion]);
 
   const makeConfig = (): PackConfig => ({
@@ -91,14 +109,16 @@ export default function BuildView(props: Props) {
   };
 
   const checkForUpdates = async () => {
+    const seq = ++updSeq.current;
     setBusy(true);
     pushLog(`> Checking for ${loader} ${mcVersion} builds of your mods…`);
     try {
       const u = await checkUpdates(loader, mcVersion);
+      if (seq !== updSeq.current) return; // target changed mid-check
       setUpdates(u);
       pushLog(`✓ ${u.length} mod(s) have a ${loader} build for ${mcVersion}`);
     } catch (e) {
-      pushLog(`✗ update check failed: ${e}`);
+      if (seq === updSeq.current) pushLog(`✗ update check failed: ${e}`);
     } finally {
       setBusy(false);
     }

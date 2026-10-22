@@ -24,7 +24,7 @@ interface Props {
   mods: ModInfo[];
   compat: CompatReport | null;
   settings: PackSettings;
-  setSettings: (s: PackSettings) => void;
+  setSettings: React.Dispatch<React.SetStateAction<PackSettings>>;
 }
 
 const LOADER_ICON: Record<string, string> = {

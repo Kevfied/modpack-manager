@@ -60,9 +60,14 @@ export default function App() {
     }));
   }, [compat]);
 
+  // Trailing progress events can land after a scan fully finished —
+  // without the gate the statusbar sticks on "hashing n/n…".
+  const scanning = useRef(false);
   useEffect(() => {
     const un = listen<{ done: number; total: number }>("scan-progress", (e) => {
-      setStatus(`hashing ${e.payload.done}/${e.payload.total}…`);
+      if (scanning.current) {
+        setStatus(`hashing ${e.payload.done}/${e.payload.total}…`);
+      }
     });
     return () => {
       un.then((f) => f());
@@ -153,11 +158,15 @@ export default function App() {
     }
   };
 
+  // Toggles don't await the report — last-issued must win, not
+  // last-resolved, or the banner can describe an older selection.
+  const compatSeq = useRef(0);
   const refreshCompat = useCallback(
     async (allMods: ModInfo[], res: Record<string, ResolvedMod>, sel: Set<string>) => {
+      const seq = ++compatSeq.current;
       if (sel.size === 0) { setCompat(null); return; }
       const report = await compatReport(allMods, res, [...sel]);
-      setCompat(report);
+      if (seq === compatSeq.current) setCompat(report);
     },
     []
   );
@@ -188,6 +197,7 @@ export default function App() {
   const onScan = useCallback(
     async (path: string) => {
       setBusy(true);
+      scanning.current = true;
       setStatus("Scanning…");
       try {
         setFolder(path);
@@ -195,6 +205,7 @@ export default function App() {
       } catch (e) {
         setStatus(`Error: ${e}`);
       } finally {
+        scanning.current = false;
         setBusy(false);
       }
     },
@@ -204,12 +215,14 @@ export default function App() {
   const onScanFiles = useCallback(
     async (paths: string[]) => {
       setBusy(true);
+      scanning.current = true;
       setStatus("Scanning…");
       try {
         await mergeScan(await scanFiles(paths));
       } catch (e) {
         setStatus(`Error: ${e}`);
       } finally {
+        scanning.current = false;
         setBusy(false);
       }
     },

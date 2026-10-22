@@ -63,18 +63,26 @@ export default function ConnectView(props: Props) {
   const pushLog = (line: string) =>
     setLog((l) => [...l, ...line.split("\n").filter(Boolean)]);
 
+  // Only the freshest refresh may write state — a poll already in flight
+  // when the user joins/leaves/applies would otherwise land after the
+  // action's own refresh and snap the view back for a whole interval.
+  const refreshSeq = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     try {
       const s = await connectStatus();
+      // Reported once per kick — log even if this response is stale.
       if (s.kicked) {
         pushLog("x you were kicked from the network — rejoin with the code");
       }
+      if (seq !== refreshSeq.current) return;
       setStatus(s);
     } catch (e) {
-      pushLog(`x status: ${e}`);
+      if (seq === refreshSeq.current) pushLog(`x status: ${e}`);
     }
     try {
-      setFound(await scanNetworks());
+      const f = await scanNetworks();
+      if (seq === refreshSeq.current) setFound(f);
     } catch {
       /* discovery listener may be off */
     }
