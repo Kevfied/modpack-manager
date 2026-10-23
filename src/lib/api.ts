@@ -368,6 +368,9 @@ export const pickUpdateBundle = (folder: string) =>
 export const setUpdateHostIp = (addr: string) =>
   invoke<void>("set_update_host_ip", { addr });
 
+export const setAutostart = (on: boolean) =>
+  invoke<void>("set_autostart", { on });
+
 // Track the tray-hidden flag once for all views — while hidden, polls
 // pause so the app idles at ~0 CPU.
 listen("window-hidden", () => (appHidden.current = true));

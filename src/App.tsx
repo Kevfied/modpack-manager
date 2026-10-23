@@ -16,11 +16,12 @@ import {
   resolveMods,
   scanFiles,
   scanFolder,
+  setAutostart,
   skipAppVersion,
   tailLog,
   unskipAppVersion,
 } from "./lib/api";
-import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { isEnabled } from "@tauri-apps/plugin-autostart";
 import type {
   AppUpdateStatus,
   CompatReport,
@@ -347,8 +348,7 @@ export default function App() {
                     onChange={async (e) => {
                       const on = e.target.checked;
                       try {
-                        if (on) await enable();
-                        else await disable();
+                        await setAutostart(on);
                         setAutostartOn(on);
                       } catch {
                         /* registry unavailable */

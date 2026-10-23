@@ -576,6 +576,25 @@ fn set_update_host_ip(addr: String) {
     appupdate::add_manual_seeder(&addr);
 }
 
+/// Startup toggle — goes through the backend so the "configured" flag is
+/// always written, protecting an explicit OFF from the first-run default.
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let res = if on {
+        app.autolaunch().enable()
+    } else {
+        app.autolaunch().disable()
+    };
+    res.map_err(|e| e.to_string())?;
+    let _ = std::fs::write(
+        update_app_dir().join("autostart-configured"),
+        if on { "1" } else { "0" },
+    );
+    alog!("app", "autostart {} via settings", if on { "enabled" } else { "disabled" });
+    Ok(())
+}
+
 #[tauri::command]
 fn update_seeders() -> Vec<appupdate::FoundSeeder> {
     appupdate::found_seeders()
@@ -732,6 +751,20 @@ pub fn run() {
             // Session logging first — everything below writes to it.
             applog::init(&update_app_dir());
             alog!("app", "starting {}", env!("CARGO_PKG_VERSION"));
+            // First-run default: launch at login. The flag file doubles as
+            // "user configured this" — once it exists we never touch the
+            // registry entry again, so an explicit OFF stays off.
+            let auto_flag = update_app_dir().join("autostart-configured");
+            if !auto_flag.exists() {
+                use tauri_plugin_autostart::ManagerExt;
+                match app.autolaunch().enable() {
+                    Ok(()) => {
+                        let _ = std::fs::write(&auto_flag, "1");
+                        alog!("app", "autostart enabled by default");
+                    }
+                    Err(e) => alog!("app", "autostart default enable failed: {e}"),
+                }
+            }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -855,6 +888,7 @@ pub fn run() {
             unskip_app_version,
             pick_update_bundle,
             set_update_host_ip,
+            set_autostart,
             update_seeders,
             open_logs_dir,
             tail_log,
