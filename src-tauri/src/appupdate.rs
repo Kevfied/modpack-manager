@@ -451,63 +451,44 @@ pub fn set_seed_hook(f: impl Fn() + Send + Sync + 'static) {
     let _ = SEED_HOOK.set(Box::new(f));
 }
 
+/// There is exactly ONE UDP socket on the broadcast port — sync's listener
+/// demuxes by `magic` and hands MMPKAPP datagrams here via
+/// `note_seeder_announce`. A second socket would starve whichever bound
+/// first: on Windows SO_REUSEADDR delivers each datagram to only one bound
+/// socket, so two listeners on one port can never both hear traffic.
 pub fn start_update_listener() {
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::Relaxed) {
+    crate::sync::start_discovery_listener();
+}
+
+/// sync's UDP demux calls this for every MMPKAPP datagram received.
+pub(crate) fn note_seeder_announce(v: &serde_json::Value, src: std::net::IpAddr) {
+    let port = v["port"].as_u64().unwrap_or(sync::HTTP_PORT as u64);
+    let f = FoundSeeder {
+        addr: format!("{src}:{port}"),
+        bundle_version: v["bundleVersion"].as_str().unwrap_or("").to_string(),
+        running_version: v["runningVersion"].as_str().unwrap_or("").to_string(),
+        machine: v["machine"].as_str().unwrap_or("?").to_string(),
+        seen: now_secs(),
+    };
+    if f.bundle_version.is_empty() {
         return;
     }
-    std::thread::spawn(|| {
-        let sock = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        );
-        let Ok(sock) = sock else { return };
-        let _ = sock.set_reuse_address(true);
-        #[cfg(unix)]
-        let _ = sock.set_reuse_port(true);
-        let addr: std::net::SocketAddr =
-            format!("0.0.0.0:{}", sync::BROADCAST_PORT).parse().unwrap();
-        if sock.bind(&addr.into()).is_err() {
-            return;
+    let mut m = found_map().lock().unwrap();
+    let changed = m
+        .get(&f.addr)
+        .map(|o| o.bundle_version != f.bundle_version)
+        .unwrap_or(true);
+    let machine = f.machine.clone();
+    let version = f.bundle_version.clone();
+    let addr = f.addr.clone();
+    m.insert(addr.clone(), f);
+    drop(m);
+    if changed {
+        crate::alog!("upd", "seeder {machine} offers v{version} ({addr})");
+        if let Some(h) = SEED_HOOK.get() {
+            h();
         }
-        let sock: UdpSocket = sock.into();
-        let mut buf = [0u8; 2048];
-        loop {
-            let (n, src) = match sock.recv_from(&mut buf) {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) else {
-                continue;
-            };
-            if v["magic"].as_str() != Some("MMPKAPP") {
-                continue;
-            }
-            let port = v["port"].as_u64().unwrap_or(sync::HTTP_PORT as u64);
-            let f = FoundSeeder {
-                addr: format!("{}:{port}", src.ip()),
-                bundle_version: v["bundleVersion"].as_str().unwrap_or("").to_string(),
-                running_version: v["runningVersion"].as_str().unwrap_or("").to_string(),
-                machine: v["machine"].as_str().unwrap_or("?").to_string(),
-                seen: now_secs(),
-            };
-            if !f.bundle_version.is_empty() {
-                let mut m = found_map().lock().unwrap();
-                let changed = m
-                    .get(&f.addr)
-                    .map(|o| o.bundle_version != f.bundle_version)
-                    .unwrap_or(true);
-                m.insert(f.addr.clone(), f);
-                drop(m);
-                if changed {
-                    if let Some(h) = SEED_HOOK.get() {
-                        h();
-                    }
-                }
-            }
-        }
-    });
+    }
 }
 
 /// Seeders seen recently, best version first.

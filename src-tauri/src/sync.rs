@@ -1319,6 +1319,14 @@ pub fn start_discovery_listener() {
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) else {
                 continue;
             };
+            // One socket owns the port and demuxes by magic — a second
+            // listener would starve one of the two on Windows, where
+            // SO_REUSEADDR never duplicates datagrams across sockets.
+            match v["magic"].as_str() {
+                Some("MMPKAPP") => crate::appupdate::note_seeder_announce(&v, src.ip()),
+                Some("MMPK1") => {}
+                _ => continue,
+            }
             if v["magic"].as_str() != Some("MMPK1") {
                 continue;
             }

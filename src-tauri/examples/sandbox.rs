@@ -1820,6 +1820,32 @@ fn main() {
             .get(format!("http://{addr}/app/file?name=../evil.exe"))
             .send().await.unwrap();
         check(r.status().is_client_error(), "/app/file traversal rejected");
+        // UDP demux: ONE socket on 47677 must route MMPKAPP datagrams to the
+        // seeder map even while the discovery listener owns the port —
+        // two separate listeners starve each other on Windows.
+        {
+            let ann = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            ann.set_broadcast(true).unwrap();
+            let msg = serde_json::json!({
+                "magic": "MMPKAPP", "bundleVersion": "99.0.0",
+                "runningVersion": "0.0.1", "port": 47999u32,
+                "machine": "sbxfake"
+            }).to_string();
+            for _ in 0..3 {
+                ann.send_to(msg.as_bytes(), "255.255.255.255:47677").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            let mut heard = false;
+            for _ in 0..30 {
+                if appupdate::found_seeders().iter().any(|s| s.machine == "sbxfake"
+                    && s.bundle_version == "99.0.0" && s.addr.ends_with(":47999")) {
+                    heard = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            check(heard, "MMPKAPP demuxed into seeder map over real UDP");
+        }
         // Concurrency: manifest fetch while a payload download is open.
         let h2 = http.clone();
         let u = format!("http://{addr}/app/file?name={fname}");
