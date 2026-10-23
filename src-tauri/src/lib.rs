@@ -1,3 +1,4 @@
+pub mod applog;
 pub mod appupdate;
 pub mod compat;
 pub mod launchers;
@@ -340,6 +341,12 @@ fn host_kick(state: tauri::State<'_, AppState>, member_id: u64) -> Result<String
     sync::host_kick(&state.host, &sync::store_path(), member_id).map_err(|e| e.to_string())
 }
 
+/// Remove a member row WITHOUT banning — for ghosts, not for kicks.
+#[tauri::command]
+fn host_forget(state: tauri::State<'_, AppState>, member_id: u64) -> Result<String, String> {
+    sync::host_forget(&state.host, &sync::store_path(), member_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn host_stop(state: tauri::State<'_, AppState>) {
     sync::host_stop(&state.host, &sync::store_path());
@@ -371,8 +378,22 @@ async fn join_network(
 }
 
 #[tauri::command]
-fn leave_network(state: tauri::State<'_, AppState>) {
-    sync::leave_network(&state.sync_client, &sync::store_path());
+async fn leave_network(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let http = state.client.inner_http().clone();
+    sync::leave_network(&state.sync_client, &http, &sync::store_path()).await;
+    Ok(())
+}
+
+/// Fetch `/info` for a manual join — the UI reads `requiresCode` to
+/// decide whether to ask for a join code at all.
+#[tauri::command]
+async fn connect_network_info(
+    state: tauri::State<'_, AppState>,
+    addr: String,
+) -> Result<serde_json::Value, String> {
+    sync::network_info(state.client.inner_http(), &addr)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -403,18 +424,18 @@ async fn apply_update(
         &state.sync_client,
         state.client.inner_http(),
         &sync::store_path(),
-        move |i, total, name, done_b, total_b| {
-            let _ = app.emit(
-                "connect-apply-progress",
-                serde_json::json!({
-                    "done": i, "total": total, "name": name,
-                    "doneBytes": done_b, "totalBytes": total_b
-                }),
-            );
+        move |p| {
+            let _ = app.emit("connect-apply-progress", p);
         },
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Ask the running apply to stop — `.part` files stay for the next resume.
+#[tauri::command]
+fn cancel_apply() {
+    sync::cancel_apply();
 }
 
 #[tauri::command]
@@ -528,6 +549,28 @@ fn pick_update_bundle(state: tauri::State<'_, AppState>, folder: String) -> Resu
         .map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------- logging
+
+/// Open the logs folder in Explorer so a bug report is one click away.
+#[tauri::command]
+fn open_logs_dir() -> Result<(), String> {
+    let p = applog::path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .ok_or("logging not initialized")?;
+    std::process::Command::new("explorer.exe")
+        .arg(&p)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The newest `n` session-log lines — Connect's "copy logs" button puts
+/// them on the clipboard for a bug report.
+#[tauri::command]
+fn tail_log(n: usize) -> Vec<String> {
+    applog::tail(n.min(500))
+}
+
 #[tauri::command]
 fn set_update_host_ip(addr: String) {
     appupdate::add_manual_seeder(&addr);
@@ -609,10 +652,75 @@ async fn find_missing_deps(
     Ok(warnings)
 }
 
+/// Real Windows "Efficiency mode": IDLE priority + EcoQoS power
+/// throttling on the main process while the window sits in the tray.
+/// WebView2 children aren't ours to throttle — the backend is where the
+/// work happens anyway.
+#[cfg(windows)]
+fn set_efficiency(on: bool) {
+    use windows_sys::Win32::System::Threading::*;
+    unsafe {
+        let p = GetCurrentProcess();
+        let _ = SetPriorityClass(
+            p,
+            if on {
+                IDLE_PRIORITY_CLASS
+            } else {
+                NORMAL_PRIORITY_CLASS
+            },
+        );
+        let st = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: if on {
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            } else {
+                0
+            },
+        };
+        let _ = SetProcessInformation(
+            p,
+            ProcessPowerThrottling,
+            &st as *const _ as *const _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn set_efficiency(_on: bool) {}
+
+/// Window hidden ↔ shown — slows backend loops, toggles EcoQoS, tells the
+/// frontend to pause its polls.
+fn set_window_hidden(app: &tauri::AppHandle, hidden: bool) {
+    sync::set_hidden(hidden);
+    set_efficiency(hidden);
+    use tauri::Emitter;
+    let _ = app.emit(if hidden { "window-hidden" } else { "window-shown" }, ());
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+        set_window_hidden(app, false);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance FIRST — a second launch focuses the trayed
+        // window instead of spawning a zombie that can't bind the port.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--tray".into()]),
+        ))
         .manage(AppState {
             client: ModrinthClient::new(),
             mods: Mutex::new(vec![]),
@@ -621,6 +729,9 @@ pub fn run() {
             resumed: AtomicBool::new(false),
         })
         .setup(|app| {
+            // Session logging first — everything below writes to it.
+            applog::init(&update_app_dir());
+            alog!("app", "starting {}", env!("CARGO_PKG_VERSION"));
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -647,7 +758,57 @@ pub fn run() {
             appupdate::set_seed_hook(move || {
                 let _ = h.emit("appupdate-offer", ());
             });
+
+            // Tray: X hides to the icon; real quit lives on the menu.
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::TrayIconBuilder;
+            let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            let mut tray = TrayIconBuilder::new()
+                .menu(&menu)
+                .on_menu_event(|app, e| match e.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => {
+                        alog!("tray", "quit via tray menu");
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, e| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = e
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            let _tray = tray.build(app)?;
+
+            // --tray (autostart launches) → stay hidden; otherwise show.
+            if let Some(w) = app.get_webview_window("main") {
+                if std::env::args().any(|a| a == "--tray") {
+                    alog!("tray", "launched with --tray — staying hidden");
+                    let h = app.handle().clone();
+                    set_window_hidden(&h, true);
+                } else {
+                    let _ = w.show();
+                }
+            }
             Ok(())
+        })
+        .on_window_event(|win, ev| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
+                // X → tray, not quit. Quit lives on the tray menu.
+                api.prevent_close();
+                let _ = win.hide();
+                set_window_hidden(&win.app_handle(), true);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             scan_folder,
@@ -672,12 +833,15 @@ pub fn run() {
             host_set_folder,
             host_update,
             host_kick,
+            host_forget,
             host_stop,
             scan_networks,
             join_network,
             leave_network,
+            connect_network_info,
             connect_status,
             apply_update,
+            cancel_apply,
             decline_update,
             list_synced_packs,
             load_synced_pack,
@@ -692,6 +856,8 @@ pub fn run() {
             pick_update_bundle,
             set_update_host_ip,
             update_seeders,
+            open_logs_dir,
+            tail_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

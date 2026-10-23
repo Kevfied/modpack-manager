@@ -287,3 +287,63 @@ td.dim, .dim { color: var(--text-dim); }
 .upd-card p { margin: 6px 0; font-size: 0.8rem; }
 .upd-warn { color: var(--text); font-weight: 700; font-size: 0.8rem; }
 .upd-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+/* ---- connect apply progress + gear menu ---- */
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 0;
+}
+.file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.log-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+.log-tools button {
+  font-size: 0.72rem;
+  padding: 1px 8px;
+}
+.gear-wrap { position: relative; }
+.gear-btn {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 1rem;
+  padding: 2px 10px;
+}
+.gear-btn:hover { color: var(--text); }
+.gear-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+.gear-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 91;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 220px;
+  font-size: 0.8rem;
+}
+.gear-menu label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  cursor: pointer;
+}
+.gear-menu button { text-align: left; }

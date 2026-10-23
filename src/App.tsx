@@ -4,19 +4,23 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import {
   ackAppUpdate,
+  appHidden,
   appUpdateStatus,
   cancelAppUpdate,
   compatReport,
   connectStatus,
   downloadAppUpdate,
   installAppUpdate,
+  openLogsDir,
   openReleaseNotes,
   resolveMods,
   scanFiles,
   scanFolder,
   skipAppVersion,
+  tailLog,
   unskipAppVersion,
 } from "./lib/api";
+import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import type {
   AppUpdateStatus,
   CompatReport,
@@ -41,6 +45,14 @@ export default function App() {
   const [compat, setCompat] = useState<CompatReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  // Titlebar gear: startup toggle + log access.
+  const [gearOpen, setGearOpen] = useState(false);
+  const [autostartOn, setAutostartOn] = useState(false);
+  useEffect(() => {
+    isEnabled()
+      .then(setAutostartOn)
+      .catch(() => {});
+  }, []);
   const [settings, setSettings] = useState<PackSettings>({
     name: "My Modpack",
     version: "1.0.0",
@@ -111,7 +123,9 @@ export default function App() {
     };
     poll();
     getVersion().then(setAppVer).catch(() => {});
-    const t = setInterval(poll, 5000);
+    const t = setInterval(() => {
+      if (!appHidden.current) poll();
+    }, 5000);
     const un = listen("appupdate-progress", poll);
     // A seeder announce (new or version-bumped) re-checks instantly —
     // the offer shows within a second of a peer publishing.
@@ -314,6 +328,61 @@ export default function App() {
           </button>
         </nav>
         <div className="spacer" style={{ flex: 1 }} />
+        <div className="gear-wrap">
+          <button
+            className="gear-btn"
+            title="Settings"
+            onClick={() => setGearOpen((v) => !v)}
+          >
+            &#9881;
+          </button>
+          {gearOpen && (
+            <>
+              <div className="gear-veil" onClick={() => setGearOpen(false)} />
+              <div className="gear-menu">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={autostartOn}
+                    onChange={async (e) => {
+                      const on = e.target.checked;
+                      try {
+                        if (on) await enable();
+                        else await disable();
+                        setAutostartOn(on);
+                      } catch {
+                        /* registry unavailable */
+                      }
+                    }}
+                  />
+                  Launch on Windows startup
+                </label>
+                <button
+                  onClick={() => {
+                    setGearOpen(false);
+                    openLogsDir();
+                  }}
+                >
+                  Open logs folder
+                </button>
+                <button
+                  onClick={async () => {
+                    setGearOpen(false);
+                    try {
+                      const lines = await tailLog(200);
+                      await navigator.clipboard.writeText(lines.join("\n"));
+                      setStatus("✓ last 200 log lines copied");
+                    } catch (e) {
+                      setStatus(`x logs: ${e}`);
+                    }
+                  }}
+                >
+                  Copy logs to clipboard
+                </button>
+              </div>
+            </>
+          )}
+        </div>
         <div className="win-btns">
           <button onClick={() => win.minimize()} title="Minimize">&#x2014;</button>
           <button onClick={() => win.toggleMaximize()} title="Maximize">&#x25A1;</button>

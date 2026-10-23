@@ -404,7 +404,15 @@ pub fn start_update_announcer(hs: sync::SharedHost, app_dir: PathBuf) {
         };
         let _ = sock.set_broadcast(true);
         loop {
-            std::thread::sleep(Duration::from_secs(ANNOUNCE_SECS));
+            // Slowed — not stopped — while the window is trayed: peers
+            // can still discover and pull the seeded bundle.
+            std::thread::sleep(Duration::from_secs(
+                if sync::APP_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+                    15
+                } else {
+                    ANNOUNCE_SECS
+                },
+            ));
             let Some(version) = seed_bundle_version(&app_dir) else {
                 continue; // nothing to serve — stay silent
             };

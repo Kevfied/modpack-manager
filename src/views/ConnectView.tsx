@@ -2,10 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
+  appHidden,
   applyUpdate,
+  cancelApply,
+  connectNetworkInfo,
   connectStatus,
   declineUpdate,
   detectLaunchers,
+  hostForget,
   hostKick,
   hostPublish,
   hostSetFolder,
@@ -18,6 +22,7 @@ import {
   loadSyncedPack,
   packExists,
   scanNetworks,
+  tailLog,
 } from "../lib/api";
 import type {
   ApplyProgress,
@@ -55,12 +60,18 @@ export default function ConnectView(props: Props) {
   // join form
   const [joinAddr, setJoinAddr] = useState("");
   const [joinCode, setJoinCode] = useState("");
+  // null = unknown (manual addr / old host) → show the code field;
+  // false = announced open → hide it entirely.
+  const [joinNeedsCode, setJoinNeedsCode] = useState<boolean | null>(null);
   const [displayName, setDisplayName] = useState(savedName());
   // post-apply: launcher picker + synced pack meta
   const [launchers, setLaunchers] = useState<LauncherInfo[]>([]);
   const [syncedPack, setSyncedPack] = useState<SyncedPackInfo | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
   // live download progress while apply_update streams files
   const [applyProg, setApplyProg] = useState<ApplyProgress | null>(null);
+  // Byte samples for the download speed/ETA readout.
+  const speedSamples = useRef<{ t: number; b: number }[]>([]);
   const timer = useRef<number | null>(null);
   // Mirror of `busy` for the interval callback — while apply/publish runs,
   // connectStatus polls would re-hash every synced file (diff_manifest)
@@ -101,7 +112,7 @@ export default function ConnectView(props: Props) {
   useEffect(() => {
     refresh();
     timer.current = window.setInterval(() => {
-      if (!busyRef.current) refresh();
+      if (!busyRef.current && !appHidden.current) refresh();
     }, 4000);
     // A network announce (new network, version bump, member change)
     // refreshes instantly — found networks and pending updates appear
@@ -134,7 +145,9 @@ export default function ConnectView(props: Props) {
         .catch(() => {});
     };
     load();
-    const t = window.setInterval(load, 5000);
+    const t = window.setInterval(() => {
+      if (!appHidden.current) load();
+    }, 5000);
     return () => window.clearInterval(t);
   }, [joined, applied, nid]);
 
@@ -244,7 +257,20 @@ export default function ConnectView(props: Props) {
     localStorage.setItem("mm-display-name", displayName.trim());
     setBusy(true);
     try {
-      pushLog(await joinNetwork(addr, joinCode, displayName.trim()));
+      // Open networks never ask for a code. `null` means the announce
+      // didn't say (old host) or it's a manual IP — ask /info to be sure.
+      let code = joinCode;
+      let needs = joinNeedsCode;
+      if (needs === null) {
+        try {
+          const info = await connectNetworkInfo(addr);
+          needs = info.requiresCode !== false;
+        } catch {
+          needs = true; // unreachable → let the join error surface it
+        }
+      }
+      if (needs === false) code = "";
+      pushLog(await joinNetwork(addr, code, displayName.trim()));
       setJoinAddr("");
       setJoinCode("");
       await refresh();
@@ -289,12 +315,57 @@ export default function ConnectView(props: Props) {
     }
   };
 
+  // Remove a dead row without banning — ghosts from members who left
+  // before /leave existed, or whose ids changed.
+  const doForget = async (id: number, name: string) => {
+    if (
+      !(await confirm(
+        `Forget ${name}? Their row is removed — they are NOT banned and can rejoin anytime.`,
+        { title: "Forget member", okLabel: "Forget", cancelLabel: "Cancel" }
+      ))
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      pushLog(await hostForget(id));
+      await refresh();
+    } catch (e) {
+      pushLog(`x ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doCancelApply = async () => {
+    try {
+      await cancelApply();
+      pushLog("! cancel requested — finishing current chunk");
+    } catch (e) {
+      pushLog(`x ${e}`);
+    }
+  };
+
+  const doCopyLogs = async () => {
+    try {
+      const lines = await tailLog(200);
+      await navigator.clipboard.writeText(lines.join("\n"));
+      pushLog("✓ last 200 log lines copied to clipboard");
+    } catch (e) {
+      pushLog(`x logs: ${e}`);
+    }
+  };
+
   const doApply = async () => {
     setBusy(true);
     setApplyProg(null);
+    speedSamples.current = [];
     try {
       pushLog(await applyUpdate());
       await refresh();
+      // The apply finished — the launcher picker is the expected next
+      // step, so open it instead of making them scroll to find it.
+      setPickerOpen(true);
     } catch (e) {
       pushLog(`x ${e}`);
     } finally {
@@ -302,6 +373,26 @@ export default function ConnectView(props: Props) {
       setBusy(false);
     }
   };
+
+  // Download speed + ETA from the byte-progress samples.
+  const speedEta = (() => {
+    if (!applyProg || applyProg.phase !== "downloading") return "";
+    const now = Date.now();
+    const samples = speedSamples.current;
+    if (samples.length === 0 || now - samples[samples.length - 1].t > 250) {
+      samples.push({ t: now, b: applyProg.doneBytes });
+      if (samples.length > 12) samples.shift();
+    }
+    if (samples.length < 2) return "";
+    const dt = (now - samples[0].t) / 1000;
+    if (dt <= 0) return "";
+    const bps = (applyProg.doneBytes - samples[0].b) / dt;
+    if (bps <= 0) return "";
+    const rem = applyProg.totalBytes - applyProg.doneBytes;
+    const eta = rem > 0 ? Math.ceil(rem / bps) : 0;
+    const mbps = (bps / 1048576).toFixed(1);
+    return ` · ${mbps} MB/s` + (eta > 0 ? ` · ~${eta}s left` : "");
+  })();
 
   const doDecline = async (version: number) => {
     setBusy(true);
@@ -361,13 +452,24 @@ export default function ConnectView(props: Props) {
               {canKick && (
                 <td>
                   {!m.host && (
-                    <button
-                      className="row-del"
-                      title={`Kick ${m.name}`}
-                      onClick={() => doKick(m.id, m.name)}
-                    >
-                      ×
-                    </button>
+                    <>
+                      {!m.online && (
+                        <button
+                          className="row-del"
+                          title={`Forget ${m.name} — remove this row (not banned)`}
+                          onClick={() => doForget(m.id, m.name)}
+                        >
+                          –
+                        </button>
+                      )}
+                      <button
+                        className="row-del"
+                        title={`Kick ${m.name} — blocked until they rejoin with the code`}
+                        onClick={() => doKick(m.id, m.name)}
+                      >
+                        ×
+                      </button>
+                    </>
                   )}
                 </td>
               )}
@@ -531,20 +633,58 @@ export default function ConnectView(props: Props) {
               </div>
               {applyProg ? (
                 <div style={{ marginTop: 8 }}>
-                  <div className="dim">
-                    downloading {applyProg.done + 1 > applyProg.total ? applyProg.total : applyProg.done + 1}
-                    /{applyProg.total} — {applyProg.name}
-                    {applyProg.totalBytes > 0 &&
-                      ` · ${Math.round((applyProg.doneBytes / applyProg.totalBytes) * 100)}%`}
-                  </div>
-                  {applyProg.totalBytes > 0 && (
-                    <div className="upd-prog">
-                      <div
-                        style={{
-                          width: `${(applyProg.doneBytes / applyProg.totalBytes) * 100}%`,
-                        }}
-                      />
+                  {applyProg.phase === "hashing" ? (
+                    <div className="dim">
+                      checking local files {applyProg.hashingDone}/
+                      {applyProg.hashingTotal}
+                      {applyProg.hashingFile
+                        ? ` — ${applyProg.hashingFile}`
+                        : "…"}
                     </div>
+                  ) : (
+                    <>
+                      <div className="dim">
+                        {applyProg.phase === "cancelled"
+                          ? "cancelling…"
+                          : `downloading ${applyProg.doneFiles}/${applyProg.totalFiles} files`}
+                        {applyProg.totalBytes > 0 &&
+                          ` · ${(applyProg.doneBytes / 1048576).toFixed(1)}/${(applyProg.totalBytes / 1048576).toFixed(1)} MB · ${Math.round((applyProg.doneBytes / applyProg.totalBytes) * 100)}%`}
+                        {speedEta}
+                      </div>
+                      {applyProg.totalBytes > 0 && (
+                        <div className="upd-prog" style={{ flexBasis: "100%" }}>
+                          <div
+                            style={{
+                              width: `${Math.min(100, (applyProg.doneBytes / applyProg.totalBytes) * 100)}%`,
+                            }}
+                          />
+                        </div>
+                      )}
+                      {applyProg.files
+                        .filter((f) => f.done < f.total)
+                        .slice(0, 4)
+                        .map((f) => (
+                          <div className="dim mono file-row" key={f.name}>
+                            <span className="file-name">{f.name}</span>
+                            <span>
+                              {f.total > 0
+                                ? `${Math.round((f.done / f.total) * 100)}%`
+                                : "…"}
+                              {f.retries > 0 && ` · retry ${f.retries}`}
+                            </span>
+                          </div>
+                        ))}
+                      {applyProg.failed.length > 0 && (
+                        <div className="err">
+                          failed: {applyProg.failed.join(", ")}
+                        </div>
+                      )}
+                      <div style={{ marginTop: 6 }}>
+                        <button onClick={doCancelApply} disabled={!busy}>
+                          Cancel — keep progress for later
+                        </button>
+                      </div>
+                    </>
                   )}
                 </div>
               ) : (
@@ -607,9 +747,48 @@ export default function ConnectView(props: Props) {
         </div>
         {log.length > 0 && (
           <div className="log-box">
+            <div className="log-tools">
+              <button onClick={doCopyLogs}>copy logs</button>
+            </div>
             {log.map((l, i) => (
               <div key={i} className={l.startsWith("x") || l.startsWith("!") ? "err" : "ok"}>{l}</div>
             ))}
+          </div>
+        )}
+        {pickerOpen && (
+          <div className="upd-overlay" onClick={() => setPickerOpen(false)}>
+            <div className="upd-card" onClick={(e) => e.stopPropagation()}>
+              <h3>Pack synced — install it</h3>
+              {launchers.length === 0 ? (
+                <p className="dim">
+                  No launcher was detected — use the Loader tab, or install
+                  Minecraft / TLauncher / Prism.
+                </p>
+              ) : (
+                <>
+                  <p className="dim">
+                    Pick a launcher to install v{status.appliedVersion} into:
+                  </p>
+                  <div className="upd-actions">
+                    {launchers.map((l) => (
+                      <button
+                        key={l.kind}
+                        className="primary"
+                        onClick={() => {
+                          setPickerOpen(false);
+                          loadSyncedInto(l);
+                        }}
+                      >
+                        {l.name}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+              <div className="upd-actions">
+                <button onClick={() => setPickerOpen(false)}>Later</button>
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -664,13 +843,29 @@ export default function ConnectView(props: Props) {
           <div className="launcher-card" key={n.networkId}>
             <div style={{ fontSize: "1.4rem" }}>⇄</div>
             <div className="grow">
-              <div className="name">{n.name}</div>
+              <div className="name">
+                {n.name}{" "}
+                <span className="badge">
+                  {n.requiresCode === false
+                    ? "open"
+                    : n.requiresCode === true
+                      ? "locked"
+                      : "locked?"}
+                </span>
+              </div>
               <div className="sub">
                 {n.machine} · pack "{n.packName}" ·{" "}
                 {n.latestVersion === 0 ? "not published yet" : `v${n.latestVersion}`} · {n.members} member(s)
               </div>
             </div>
-            <button onClick={() => setJoinAddr(n.addr)}>Join</button>
+            <button
+              onClick={() => {
+                setJoinAddr(n.addr);
+                setJoinNeedsCode(n.requiresCode ?? null);
+              }}
+            >
+              Join
+            </button>
           </div>
         ))}
         <div className="toolbar" style={{ marginTop: 10 }}>
@@ -678,7 +873,10 @@ export default function ConnectView(props: Props) {
             type="text"
             placeholder="…or host IP (e.g. 26.12.34.56)"
             value={joinAddr}
-            onChange={(e) => setJoinAddr(e.target.value)}
+            onChange={(e) => {
+              setJoinAddr(e.target.value);
+              setJoinNeedsCode(null);
+            }}
             style={{ flex: 1 }}
           />
         </div>
@@ -690,12 +888,18 @@ export default function ConnectView(props: Props) {
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
             />
-            <input
-              type="text"
-              placeholder="Join code"
-              value={joinCode}
-              onChange={(e) => setJoinCode(e.target.value)}
-            />
+            {joinNeedsCode !== false && (
+              <input
+                type="text"
+                placeholder={
+                  joinNeedsCode === null
+                    ? "Join code (if required)"
+                    : "Join code"
+                }
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+              />
+            )}
             <button className="primary" onClick={() => doJoin(joinAddr)} disabled={busy}>
               Join
             </button>
@@ -705,6 +909,9 @@ export default function ConnectView(props: Props) {
 
       {log.length > 0 && (
         <div className="log-box">
+          <div className="log-tools">
+            <button onClick={doCopyLogs}>copy logs</button>
+          </div>
           {log.map((l, i) => (
             <div key={i} className={l.startsWith("x") || l.startsWith("!") ? "err" : "ok"}>{l}</div>
           ))}

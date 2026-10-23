@@ -127,7 +127,6 @@ fn inspect_jar(path: &Path) -> Result<ModInfo> {
     let mut file = BufReader::new(File::open(path).context("open jar")?);
     let (sha1_hex, sha512_hex, size) = hash_reader(&mut file)?;
     file.seek(std::io::SeekFrom::Start(0))?;
-    let mut zip = zip::ZipArchive::new(file).context("read jar as zip")?;
 
     let mut info = ModInfo {
         path: path.to_string_lossy().to_string(),
@@ -142,6 +141,17 @@ fn inspect_jar(path: &Path) -> Result<ModInfo> {
         environment: None,
         game_versions: vec![],
         parse_error: None,
+    };
+
+    // A jar that isn't a readable zip still carries its content hashes —
+    // Connect manifests rely on them; discarding them would make the file
+    // undownloadable (members verify sha1 of the served bytes).
+    let mut zip = match zip::ZipArchive::new(file) {
+        Ok(z) => z,
+        Err(e) => {
+            info.parse_error = Some(format!("{e:#}"));
+            return Ok(info);
+        }
     };
 
     // Central-directory listing only — no per-entry seeks.

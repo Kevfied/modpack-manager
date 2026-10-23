@@ -81,6 +81,189 @@ fn make_jar(path: &Path, id: &str, extra: &str) {
     z.finish().unwrap();
 }
 
+fn sha1_bytes(b: &[u8]) -> String {
+    use sha1::Digest;
+    let mut h = sha1::Sha1::new();
+    h.update(b);
+    hex::encode(h.finalize())
+}
+
+/// A throttled byte source — one fixed delay per read so a 6-file apply
+/// is measurably parallel (sequential ~3s vs parallel ~1s).
+struct SlowReader {
+    data: Arc<Vec<u8>>,
+    pos: usize,
+    delay: std::time::Duration,
+}
+impl std::io::Read for SlowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(2048).min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        if self.pos < self.data.len() {
+            std::thread::sleep(self.delay);
+        }
+        Ok(n)
+    }
+}
+
+/// A second, independent "host" — a real tiny_http server on :47777 that
+/// serves the whole Connect protocol with per-read delays and a toggleable
+/// Range implementation. Proves parallel downloads, mid-transfer
+/// cancel+resume, and the old-host 200 fallback — none of which the
+/// instant-loopback SharedHost can exercise.
+struct FakeHost {
+    addr: String,
+    range_hits: Arc<std::sync::atomic::AtomicUsize>,
+    leave_hits: Arc<std::sync::atomic::AtomicUsize>,
+    honor_range: Arc<std::sync::atomic::AtomicBool>,
+}
+fn spawn_fake_host(files: &[(String, Vec<u8>)]) -> FakeHost {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let manifest = sync::Manifest {
+        network_id: "fake-net".into(),
+        pack_name: "Fake Pack".into(),
+        version: 1,
+        note: String::new(),
+        mc_version: "1.21.1".into(),
+        loader: "fabric".into(),
+        loader_version: "0.15.11".into(),
+        files: files
+            .iter()
+            .map(|(n, b)| sync::ManifestFile {
+                path: n.clone(),
+                sha1: sha1_bytes(b),
+                size: b.len() as u64,
+            })
+            .collect(),
+    };
+    let manifest_json = serde_json::to_string(&manifest).unwrap();
+    let srv = Arc::new(tiny_http::Server::http("127.0.0.1:47777").expect("fake host bind"));
+    let range_hits = Arc::new(AtomicUsize::new(0));
+    let leave_hits = Arc::new(AtomicUsize::new(0));
+    let honor_range = Arc::new(AtomicBool::new(true));
+    {
+        let srv = srv.clone();
+        let (rh, lh, hr) = (range_hits.clone(), leave_hits.clone(), honor_range.clone());
+        let files: Arc<Vec<(String, Arc<Vec<u8>>)>> = Arc::new(
+            files
+                .iter()
+                .map(|(n, b)| (n.clone(), Arc::new(b.clone())))
+                .collect(),
+        );
+        std::thread::spawn(move || {
+            while let Ok(req) = srv.recv() {
+                let (rh, lh, hr) = (rh.clone(), lh.clone(), hr.clone());
+                let mj = manifest_json.clone();
+                let files = files.clone();
+                // Per-request thread — parallel clients must be served
+                // concurrently, just like the real server.
+                std::thread::spawn(move || {
+                    let url = req.url().to_string();
+                    let path = url.split('?').next().unwrap_or("");
+                    let method = req.method().as_str().to_string();
+                    match (method.as_str(), path) {
+                        ("GET", "/info") => {
+                            let _ = req.respond(tiny_http::Response::from_string(
+                                r#"{"networkId":"fake-net","name":"fake-net","packName":"Fake Pack","machine":"fake","latestVersion":1,"members":0,"requiresCode":false,"appVersion":"0.0.0"}"#,
+                            ));
+                        }
+                        ("POST", "/join") => {
+                            let _ = req.respond(tiny_http::Response::from_string(
+                                r#"{"ok":true,"memberId":4242}"#,
+                            ));
+                        }
+                        ("POST", "/heartbeat") => {
+                            let _ = req.respond(tiny_http::Response::from_string(
+                                r#"{"members":[],"latestVersion":1}"#,
+                            ));
+                        }
+                        ("POST", "/leave") => {
+                            lh.fetch_add(1, Ordering::Relaxed);
+                            let _ = req.respond(tiny_http::Response::from_string(r#"{"ok":true}"#));
+                        }
+                        ("GET", "/manifest") => {
+                            let _ = req.respond(tiny_http::Response::from_string(mj));
+                        }
+                        ("GET", "/file") => {
+                            let name = url.rsplit("path=").next().unwrap_or("");
+                            let Some((_, data)) = files.iter().find(|(n, _)| n == name) else {
+                                let _ = req.respond(tiny_http::Response::empty(404));
+                                return;
+                            };
+                            let mut start = 0usize;
+                            for hdr in req.headers() {
+                                if hdr.field.equiv("Range") {
+                                    rh.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(s) = hdr
+                                        .value
+                                        .as_str()
+                                        .strip_prefix("bytes=")
+                                        .and_then(|x| x.split('-').next())
+                                        .and_then(|x| x.parse::<usize>().ok())
+                                    {
+                                        start = s.min(data.len());
+                                    }
+                                }
+                            }
+                            let ranged = hr.load(Ordering::Relaxed) && start > 0;
+                            let body: Arc<Vec<u8>> = if ranged {
+                                Arc::new(data[start..].to_vec())
+                            } else {
+                                data.clone()
+                            };
+                            let mut headers = vec![tiny_http::Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"application/octet-stream"[..],
+                            )
+                            .unwrap()];
+                            if ranged {
+                                headers.push(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Content-Range"[..],
+                                        format!(
+                                            "bytes {}-{}/{}",
+                                            start,
+                                            data.len() - 1,
+                                            data.len()
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .unwrap(),
+                                );
+                            }
+                            let resp = tiny_http::Response::new(
+                                tiny_http::StatusCode(if ranged { 206 } else { 200 }),
+                                headers,
+                                SlowReader {
+                                    data: body.clone(),
+                                    pos: 0,
+                                    delay: std::time::Duration::from_millis(10),
+                                },
+                                Some(body.len()),
+                                None,
+                            );
+                            let _ = req.respond(resp);
+                        }
+                        _ => {
+                            let _ = req.respond(tiny_http::Response::empty(404));
+                        }
+                    }
+                });
+            }
+        });
+    }
+    FakeHost {
+        addr: "127.0.0.1:47777".into(),
+        range_hits,
+        leave_hits,
+        honor_range,
+    }
+}
+
 fn main() {
     let base = std::env::temp_dir().join(format!("mm-sandbox-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -515,8 +698,657 @@ fn main() {
         );
         check(store["host"]["code"] == "newcode", "rotated code persisted");
 
+        // ---- 9e. open network: no join code asked or needed ----
+        println!("== open network ==");
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "").unwrap();
+        let info: serde_json::Value = http
+            .get(format!("http://{addr}/info"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(
+            info["requiresCode"] == false,
+            "open network reports requiresCode=false",
+        );
+        let cs5: sync::SharedClient = Arc::new(Mutex::new(None));
+        let open_join =
+            sync::join_network(&cs5, &store_path, &sync_root, &addr, "", "dave").await;
+        check(open_join.is_ok(), "open network joins with empty code");
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode").unwrap();
+        let info: serde_json::Value = http
+            .get(format!("http://{addr}/info"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(
+            info["requiresCode"] == true,
+            "locked network reports requiresCode=true",
+        );
+        // dave joined during the open window — member-id auth still works
+        // after the code is re-enabled.
+        check(
+            sync::check_pending(&cs5, &http).await.is_ok(),
+            "member joined during open window survives code re-enable",
+        );
+
+        // ---- 9f. member-id merge + id 0 guard ----
+        println!("== member ids ==");
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 7777, "name": "eve"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "eve joins as id 7777");
+        // same id rejoins with a new name → MERGE, not a second row
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 7777, "name": "eve-renamed"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "id 7777 rejoin accepted (merge)");
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "42")
+            .json(&serde_json::json!({"memberId": 42, "name": "bob", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let members = v["members"].as_array().unwrap();
+        let eve_rows = members.iter().filter(|m| m["id"] == 7777).count();
+        check(
+            eve_rows == 1 && members.iter().any(|m| m["id"] == 7777 && m["name"] == "eve-renamed"),
+            "rejoin merged — one row, new name, no duplicate",
+        );
+        // memberId 0 is reserved for the host row — server must assign one
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 0, "name": "zero"}))
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = r.json().await.unwrap();
+        check(
+            v["memberId"].as_u64().unwrap_or(0) != 0,
+            "memberId 0 rejected — server assigned a real id",
+        );
+        // ghost member: joins, never heartbeats — asserted offline-but-listed
+        // later via roster persistence.
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 5555, "name": "ghost"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "ghost member registered (id 5555)");
+
+        // ---- 9g. rejoin preserves applied_version ----
+        println!("== rejoin merge ==");
+        let alice_id = cs.lock().unwrap().as_ref().unwrap().member_id;
+        let alice_applied = cs.lock().unwrap().as_ref().unwrap().applied_version;
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": alice_id, "name": "alice"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "alice rejoins with her saved id");
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "42")
+            .json(&serde_json::json!({"memberId": 42, "name": "bob", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let a = v["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == alice_id)
+            .unwrap();
+        check(
+            a["appliedVersion"].as_u64().unwrap_or(999) == alice_applied,
+            &format!(
+                "rejoin kept applied_version v{alice_applied} (got {})",
+                a["appliedVersion"]
+            ),
+        );
+        check(a["upToDate"] == true, "rejoined alice not marked behind");
+
+        // ---- 9h. targeted publish dies with leave/forget; forget ≠ ban ----
+        println!("== target cleanup ==");
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 8888, "name": "eve2"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "eve2 joins as 8888");
+        let tgt = sync::host_publish(&hs, &store_path, "secret", Some(8888), false).unwrap();
+        check(tgt.contains("only"), "targeted publish to 8888");
+        let tm: serde_json::Value = http
+            .get(format!("http://{addr}/manifest"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "8888")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let targeted_v = tm["version"].as_u64().unwrap();
+        let global_v = {
+            let g = hs.lock().unwrap();
+            g.as_ref().unwrap().manifest.version
+        };
+        check(targeted_v != global_v, "eve2 sees her targeted manifest");
+        // leave → row AND target gone → she sees the global manifest again
+        let _ = http
+            .post(format!("http://{addr}/leave"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "8888")
+            .send()
+            .await
+            .unwrap();
+        let tm: serde_json::Value = http
+            .get(format!("http://{addr}/manifest"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "8888")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(
+            tm["version"].as_u64().unwrap() == global_v,
+            "leave clears the targeted manifest (global served)",
+        );
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "42")
+            .json(&serde_json::json!({"memberId": 42, "name": "bob", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(
+            v["members"].as_array().unwrap().iter().all(|m| m["id"] != 8888),
+            "leave removed eve2's roster row",
+        );
+        // forget: same cleanup, no ban — the id can rejoin immediately
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 8888, "name": "eve2"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "left member rejoins freely");
+        sync::host_forget(&hs, &store_path, 8888).unwrap();
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": 8888, "name": "eve2"}))
+            .send()
+            .await
+            .unwrap();
+        check(
+            r.status().is_success(),
+            "forgot member is NOT banned — instant rejoin ok",
+        );
+        // clean up eve2's row for the roster count later
+        let _ = http
+            .post(format!("http://{addr}/leave"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "8888")
+            .send()
+            .await
+            .unwrap();
+        // 7777's stale row out too (eve-renamed was a merge test)
+        let _ = http
+            .post(format!("http://{addr}/leave"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "7777")
+            .send()
+            .await
+            .unwrap();
+
+        // ---- 9i. switching networks tells the old host (fake 2nd host) ----
+        println!("== network switch ==");
+        let fake_files: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| {
+                let mut b = vec![0u8; 96 * 1024];
+                for (j, x) in b.iter_mut().enumerate() {
+                    *x = ((i * 31 + j * 7) % 251) as u8;
+                }
+                (format!("fake{i}.jar"), b)
+            })
+            .collect();
+        let fake = spawn_fake_host(&fake_files);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let fake_members_before = fake.leave_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let r = sync::join_network(&cs, &store_path, &sync_root, &fake.addr, "", "alice").await;
+        check(r.is_ok(), &format!("alice joins fake network: {:?}", r.err()));
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "42")
+            .json(&serde_json::json!({"memberId": 42, "name": "bob", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(
+            v["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["id"] != alice_id),
+            "old host dropped alice's row on network switch",
+        );
+        // …and back — the fake host must get its own /leave too
+        let r = sync::join_network(&cs, &store_path, &sync_root, &addr, "newcode", "alice").await;
+        check(r.is_ok(), &format!("alice rejoins real network: {:?}", r.err()));
+        check(
+            fake.leave_hits.load(std::sync::atomic::Ordering::Relaxed) > fake_members_before,
+            "fake host received /leave when alice switched back",
+        );
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", "42")
+            .json(&serde_json::json!({"memberId": 42, "name": "bob", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let alice_rows = v["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["name"] == "alice")
+            .count();
+        check(alice_rows == 1, "rejoin left exactly ONE alice row");
+
+        // ---- 9j. kicked member learns it on the NEXT status check ----
+        println!("== kicked probe ==");
+        let charlie_id = cs4.lock().unwrap().as_ref().unwrap().member_id;
+        sync::host_kick(&hs, &store_path, charlie_id).unwrap();
+        let e = sync::check_pending(&cs4, &http).await;
+        check(e.is_err(), "kicked member's manifest check errors");
+        check(
+            cs4.lock().unwrap().as_ref().unwrap().kicked,
+            "first 403 probed the heartbeat — kicked flag set immediately",
+        );
+        // rejoin clears the kick server-side — raw /join, because
+        // join_network would read the shared store and inherit whichever
+        // member id was last saved there (a sandbox-only artifact).
+        let r = http
+            .post(format!("http://{addr}/join"))
+            .json(&serde_json::json!({"code": "newcode", "memberId": charlie_id, "name": "charlie"}))
+            .send()
+            .await
+            .unwrap();
+        check(r.status().is_success(), "kicked member rejoins with the code");
+        let v: serde_json::Value = http
+            .post(format!("http://{addr}/heartbeat"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", charlie_id.to_string())
+            .json(&serde_json::json!({"memberId": charlie_id, "name": "charlie", "appliedVersion": 0}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        check(v["kicked"].is_null(), "rejoined charlie heartbeats normally");
+
+        // ---- 9k. parallel apply against the throttled fake host ----
+        // Each fake-network client gets its OWN sync root — sharing one
+        // would make every later apply find the files already in place.
+        println!("== parallel apply ==");
+        let sr6 = sync_root.join("c6");
+        let cs6: sync::SharedClient = Arc::new(Mutex::new(None));
+        sync::join_network(&cs6, &store_path, &sr6, &fake.addr, "", "p-join")
+            .await
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        sync::apply_update(&cs6, &http, &store_path).await.unwrap();
+        let elapsed = t0.elapsed();
+        // 6 × 96KB at 10ms/2KB ≈ 470ms/file → sequential ~2.8s, 4-way ~1s.
+        check(
+            elapsed.as_millis() < 2200,
+            &format!("parallel apply of 6 throttled files took {}ms (<2.2s)", elapsed.as_millis()),
+        );
+        let mut all_ok = true;
+        for (n, b) in &fake_files {
+            let p = sr6.join("fake-net").join("mods").join(n);
+            if !p.is_file() || std::fs::read(&p).ok().as_deref() != Some(b.as_slice()) {
+                all_ok = false;
+            }
+        }
+        check(all_ok, "all 6 parallel files byte-identical");
+
+        // ---- 9l. cancel mid-apply → .part survives → resume completes ----
+        println!("== cancel + resume ==");
+        let sr7 = sync_root.join("c7");
+        let cs7: sync::SharedClient = Arc::new(Mutex::new(None));
+        sync::join_network(&cs7, &store_path, &sr7, &fake.addr, "", "c-join")
+            .await
+            .unwrap();
+        let cs7b = cs7.clone();
+        let httpb = http.clone();
+        let storeb = store_path.clone();
+        let h7 = tokio::spawn(async move { sync::apply_update(&cs7b, &httpb, &storeb).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sync::cancel_apply();
+        let r = h7.await.unwrap();
+        let msg = r.unwrap_or_else(|e| e.to_string());
+        check(
+            msg.contains("cancelled"),
+            &format!("mid-apply cancel → '{msg}'"),
+        );
+        let mods7 = sr7.join("fake-net").join("mods");
+        let parts: Vec<_> = std::fs::read_dir(&mods7)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "part").unwrap_or(false))
+            .collect();
+        check(
+            !parts.is_empty(),
+            "cancel left .part file(s) for resume",
+        );
+        let range_before = fake.range_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let r = sync::apply_update(&cs7, &http, &store_path).await;
+        check(r.is_ok(), &format!("re-apply after cancel: {:?}", r.err()));
+        check(
+            fake.range_hits.load(std::sync::atomic::Ordering::Relaxed) > range_before,
+            "resume sent Range header(s) for the surviving .part(s)",
+        );
+        let mut all_ok = true;
+        for (n, b) in &fake_files {
+            let p = mods7.join(n);
+            if !p.is_file() || std::fs::read(&p).ok().as_deref() != Some(b.as_slice()) {
+                all_ok = false;
+            }
+        }
+        check(all_ok, "resumed files byte-identical after cancel");
+
+        // ---- 9m. explicit resume offset + old-host 200 fallback ----
+        println!("== range fallback ==");
+        let sr8 = sync_root.join("c8");
+        let cs8: sync::SharedClient = Arc::new(Mutex::new(None));
+        sync::join_network(&cs8, &store_path, &sr8, &fake.addr, "", "r-join")
+            .await
+            .unwrap();
+        let mods8 = sr8.join("fake-net").join("mods");
+        std::fs::create_dir_all(&mods8).unwrap();
+        // a .part with the correct first 4KB — a Range request should resume it
+        std::fs::write(mods8.join("fake0.part"), &fake_files[0].1[..4096]).unwrap();
+        let range_before = fake.range_hits.load(std::sync::atomic::Ordering::Relaxed);
+        sync::apply_update(&cs8, &http, &store_path).await.unwrap();
+        check(
+            fake.range_hits.load(std::sync::atomic::Ordering::Relaxed) > range_before,
+            "valid .part resumed via Range (206)",
+        );
+        let mut all_ok = true;
+        for (n, b) in &fake_files {
+            let p = mods8.join(n);
+            if !p.is_file() || std::fs::read(&p).ok().as_deref() != Some(b.as_slice()) {
+                all_ok = false;
+            }
+        }
+        check(all_ok, "resumed prefix produced correct bytes");
+        // old host ignores Range → 200 + full body → engine restarts the file
+        fake.honor_range
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for (n, _) in &fake_files {
+            let _ = std::fs::remove_file(mods8.join(n));
+        }
+        std::fs::write(mods8.join("fake0.part"), b"GARBAGEPREFIX").unwrap();
+        sync::apply_update(&cs8, &http, &store_path).await.unwrap();
+        check(
+            std::fs::read(mods8.join("fake0.jar")).ok().as_deref()
+                == Some(fake_files[0].1.as_slice()),
+            "200-on-Range restart: garbage .part did NOT corrupt the file",
+        );
+        fake.honor_range
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // ---- 9n. Range on the REAL host + host-online threshold + memo ----
+        println!("== host range / flapping / memo ==");
+        let alpha = std::fs::read(host_mods.join("alpha.jar")).unwrap();
+        let r = http
+            .get(format!("http://{addr}/file?path=alpha.jar"))
+            .header("X-Join-Code", "newcode")
+            .header("X-Member-Id", alice_id)
+            .header("Range", "bytes=10-")
+            .send()
+            .await
+            .unwrap();
+        check(r.status().as_u16() == 206, "real host honours Range → 206");
+        let body = r.bytes().await.unwrap();
+        check(
+            body.as_ref() == &alpha[10..],
+            "206 body is the requested tail",
+        );
+        // dead host: two failed checks keep host_online, the third drops it
+        let dead: sync::SharedClient = Arc::new(Mutex::new(Some(sync::ClientState {
+            network_id: "dead-net".into(),
+            network_name: "dead".into(),
+            host_addr: "127.0.0.1:1".into(),
+            code: String::new(),
+            member_id: 9,
+            display_name: "x".into(),
+            applied_version: 0,
+            declined: vec![],
+            synced_dir: base.join("dead"),
+            host_online: true,
+            consec_failures: 0,
+            applying: false,
+            kicked: false,
+            member_views: vec![],
+            latest_version: 0,
+            latest_note: String::new(),
+            hash_memo: std::collections::HashMap::new(),
+            hb_token: 1,
+        })));
+        let _ = sync::check_pending(&dead, &http).await;
+        let _ = sync::check_pending(&dead, &http).await;
+        check(
+            dead.lock().unwrap().as_ref().unwrap().host_online,
+            "2 failed checks — host still 'online' (no flap)",
+        );
+        let _ = sync::check_pending(&dead, &http).await;
+        check(
+            !dead.lock().unwrap().as_ref().unwrap().host_online,
+            "3rd consecutive miss marks host offline",
+        );
+        // hash memo: same size+mtime → skip re-hash; changed size → detect.
+        // The host's live folder may have been swapped in §6b — publish
+        // from whatever h.folder currently points at.
+        let cur_folder = hs.lock().unwrap().as_ref().unwrap().folder.clone();
+        make_jar(&cur_folder.join("epsilon.jar"), "epsilon", "1.0");
+        sync::host_publish(&hs, &store_path, "memo test", None, false).unwrap();
+        let (_, dl0, _) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
+        check(dl0 == 1, &format!("new file pending ({dl0} to fetch)"));
+        let alpha_local = sync_root
+            .join(cs.lock().unwrap().as_ref().unwrap().network_id.clone())
+            .join("mods/alpha.jar");
+        let orig_mtime = std::fs::metadata(&alpha_local)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // tamper alpha with same length, then restore its mtime — a
+        // re-hash would catch it, a memo hit must not
+        let mut tampered = std::fs::read(&alpha_local).unwrap();
+        tampered[0] ^= 0xFF;
+        std::fs::write(&alpha_local, &tampered).unwrap();
+        let ps = format!(
+            "(Get-Item '{}').LastWriteTimeUtc = [DateTimeOffset]::FromUnixTimeSeconds({}).UtcDateTime",
+            alpha_local.display(),
+            orig_mtime
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .output();
+        let (_, dl1, _) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
+        check(
+            dl1 == 1,
+            &format!("size+mtime unchanged → memo skipped re-hash ({dl1} to fetch)"),
+        );
+        // now break the size — memo miss → real hash → mismatch detected
+        tampered.push(0xEE);
+        std::fs::write(&alpha_local, &tampered).unwrap();
+        let (_, dl2, _) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
+        check(
+            dl2 >= 2,
+            &format!("size change → memo miss → tamper detected ({dl2} to fetch)"),
+        );
+        // apply repairs everything the memo let slide
+        sync::apply_update(&cs, &http, &store_path).await.unwrap();
+        check(
+            sync::check_pending(&cs, &http).await.unwrap().is_none(),
+            "apply repaired memo-masked tamper — nothing pending",
+        );
+        // epsilon was only a memo-test fixture — remove it so later
+        // sections see the original 6-jar folder again.
+        std::fs::remove_file(&cur_folder.join("epsilon.jar")).unwrap();
+        sync::host_publish(&hs, &store_path, "drop epsilon", None, false).unwrap();
+        sync::apply_update(&cs, &http, &store_path).await.unwrap();
+        check(
+            !sync_root
+                .join(cs.lock().unwrap().as_ref().unwrap().network_id.clone())
+                .join("mods/epsilon.jar")
+                .exists(),
+            "member mirror-deleted epsilon after its removal",
+        );
+
+        // 9n-ii · non-zip .jar: scanner keeps content hashes on zip-parse
+        // failure — before the fix it published sha1 "" so a member could
+        // never verify the download (permanent "sha1 mismatch").
+        {
+            let broken = cur_folder.join("broken-mod.jar");
+            let mut rng = 0x9E3779B97F4A7C15u64;
+            let mut content = vec![0u8; 50_000];
+            for b in &mut content {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                *b = rng as u8;
+            }
+            std::fs::write(&broken, &content).unwrap();
+            sync::host_publish(&hs, &store_path, "broken jar", None, false).unwrap();
+            let has_real_sha1 = hs
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .manifest
+                .files
+                .iter()
+                .find(|f| f.path == "broken-mod.jar")
+                .map(|f| f.sha1.len() == 40)
+                .unwrap_or(false);
+            check(has_real_sha1, "non-zip jar enters manifest with a real sha1");
+            sync::apply_update(&cs, &http, &store_path).await.unwrap();
+            let local_broken = sync_root
+                .join(cs.lock().unwrap().as_ref().unwrap().network_id.clone())
+                .join("mods/broken-mod.jar");
+            check(
+                std::fs::read(&local_broken)
+                    .map(|b| b == content)
+                    .unwrap_or(false),
+                "member downloads non-zip jar byte-identical",
+            );
+            std::fs::remove_file(&broken).unwrap();
+            sync::host_publish(&hs, &store_path, "drop broken", None, false).unwrap();
+            sync::apply_update(&cs, &http, &store_path).await.unwrap();
+        }
+
+        // ---- 9o. discovery TTL ----
+        println!("== discovery ttl ==");
+        sync::found_insert_for_test(sync::FoundNetwork {
+            network_id: "stale-net".into(),
+            name: "stale".into(),
+            pack_name: "x".into(),
+            machine: "x".into(),
+            addr: "10.9.9.9:47676".into(),
+            latest_version: 1,
+            members: 1,
+            app_version: "0".into(),
+            requires_code: Some(true),
+            last_seen: 1, // ancient — must be pruned on read
+        });
+        check(
+            sync::found_networks()
+                .iter()
+                .all(|f| f.network_id != "stale-net"),
+            "stale found entry pruned by TTL",
+        );
+        // our own announce should have landed in the found list by now
+        let mut found_ours = false;
+        for _ in 0..24 {
+            if let Some(f) = sync::found_networks()
+                .iter()
+                .find(|f| f.name == "sandbox-net-v2")
+            {
+                check(
+                    f.requires_code == Some(true),
+                    "announce carried requiresCode=true",
+                );
+                found_ours = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        check(found_ours, "our announce is discoverable on the LAN");
+        // alice is now on a fresh id from the network-switch rejoin —
+        // re-save her session so resume restores her, not a stale slot.
+        sync::apply_update(&cs, &http, &store_path).await.unwrap();
+
         // ---- 10. persistence / resume ----
         println!("== persistence ==");
+        // The roster must be IN connect.json — a host restart restoring
+        // an empty roster is exactly how offline members vanished.
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
+        let saved_members = store["host"]["members"].as_array().unwrap();
+        check(
+            saved_members.len() >= 4,
+            &format!(
+                "roster persisted to connect.json ({} members)",
+                saved_members.len()
+            ),
+        );
+        check(
+            saved_members.iter().any(|m| m["id"] == 5555),
+            "offline ghost row is part of the persisted roster",
+        );
         let cs2: sync::SharedClient = Arc::new(Mutex::new(None));
         let hs2: sync::SharedHost = Arc::new(Mutex::new(None));
         // can't re-host on same port — client resume only
@@ -528,11 +1360,36 @@ fn main() {
                 check(c.applied_version > 0, "applied version persisted");
             }
         }
+        {
+            // THE offline-member fix: a resumed host restores the whole
+            // roster — offline members reappear instead of vanishing.
+            let g = hs2.lock().unwrap();
+            let h = g.as_ref().expect("host resume should restore HostState");
+            check(
+                h.members.len() >= 4,
+                &format!("resumed host restored {} member rows", h.members.len()),
+            );
+            check(
+                h.members.contains_key(&5555),
+                "ghost member back in the roster after host restart",
+            );
+        }
+        // The resumed host spawned its own announcer (correct production
+        // behavior — a restarted host SHOULD announce). In-process it
+        // would keep our found entry alive forever — stop it.
+        sync::host_stop(&hs2, &store_path);
 
         // ---- 11. synced pack → loaders ----
         println!("== synced pack -> loader ==");
         let packs = sync::list_synced_packs(&inst_root);
-        check(packs.len() == 1, "synced pack listed");
+        check(!packs.is_empty(), "synced packs listed");
+        // Several networks may have synced dirs now (fake-net too) —
+        // keep only the real sandbox pack for the loader assertions.
+        let packs: Vec<_> = packs
+            .into_iter()
+            .filter(|p| p.name == "Sandbox Pack")
+            .collect();
+        check(packs.len() == 1, "sandbox pack synced dir present");
         check(
             packs[0].mc_version == "1.21.1" && packs[0].loader == "fabric",
             "synced pack carries MC/loader meta",
@@ -596,9 +1453,13 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let r = sync::check_pending(&cs, &http).await;
         check(r.is_err(), "check fails when host is down");
+        // host_online drops only after OFFLINE_MISSES consecutive misses
+        for _ in 0..3 {
+            let _ = sync::check_pending(&cs, &http).await;
+        }
         check(
             !cs.lock().unwrap().as_ref().unwrap().host_online,
-            "host marked offline, network remembered",
+            "host marked offline after 3 misses, network remembered",
         );
         check(
             cs.lock().unwrap().as_ref().unwrap().network_name == "sandbox-net-v2",
@@ -615,7 +1476,7 @@ fn main() {
     println!("== leave cleans synced dir ==");
     let leftover = { cs.lock().unwrap().as_ref().unwrap().synced_dir.clone() };
     check(leftover.join("pack.json").is_file(), "synced dir exists pre-leave");
-    sync::leave_network(&cs, &store_path);
+    rt.block_on(sync::leave_network(&cs, &http, &store_path));
     check(
         !leftover.exists(),
         "leave_network removed the synced mirror dir",
@@ -1126,6 +1987,25 @@ fn main() {
             "no seed dir → nothing advertised (build ≠ publish)",
         );
     });
+
+    // ---- 15. real TTL: our entry must die after hosting stopped ----
+    println!("== discovery ttl (real) ==");
+    {
+        let mut gone = false;
+        // The Connect host stopped in §12 — its found entry ages out at
+        // FOUND_TTL. Poll until it disappears (≤30s of slack).
+        for _ in 0..60 {
+            if sync::found_networks()
+                .iter()
+                .all(|f| f.name != "sandbox-net-v2")
+            {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        check(gone, "stopped host's entry expired from the found list");
+    }
 
     // ---- cleanup ----
     println!("== cleanup ==");

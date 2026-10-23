@@ -21,6 +21,44 @@ const CODE_HEADER: &str = "X-Join-Code";
 const MEMBER_HEADER: &str = "X-Member-Id";
 const HEARTBEAT_SECS: u64 = 15;
 const ONLINE_WINDOW_SECS: u64 = 45;
+/// Missed host contacts before `host_online` flips off — one dropped
+/// heartbeat on a congested link must not flap the badge.
+const OFFLINE_MISSES: u32 = 3;
+/// How long a found network stays listed after its announces stop.
+const FOUND_TTL_SECS: u64 = 15;
+/// Per-file GET ceiling — generous because per-chunk stall timeouts and
+/// retry/resume handle real stalls; this only bounds a dead connection.
+const FILE_TIMEOUT_SECS: u64 = 3600;
+/// Per-chunk stall guard — no bytes for this long → attempt fails, retry.
+const CHUNK_TIMEOUT_SECS: u64 = 60;
+const FILE_RETRIES: usize = 3;
+const PARALLEL_FILES: usize = 4;
+/// Progress event throttle — one emit per interval max, always emit
+/// file-start/file-done/final so the UI never misses a boundary.
+const EMIT_MS: u128 = 120;
+
+/// Set by the tray layer — while the window is hidden, background loops
+/// slow down (never stop) so hosting/presence survive efficiency mode.
+pub static APP_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Set by the cancel command — the apply engine checks it between chunks.
+static APPLY_CANCEL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_hidden(hidden: bool) {
+    if APP_HIDDEN.swap(hidden, Ordering::Relaxed) != hidden {
+        crate::alog!(
+            "tray",
+            "window {} — loops {}",
+            if hidden { "hidden" } else { "shown" },
+            if hidden { "slowed" } else { "normal" }
+        );
+    }
+}
+
+pub fn cancel_apply() {
+    APPLY_CANCEL.store(true, Ordering::Relaxed);
+    crate::alog!("xfer", "cancel requested");
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -68,7 +106,7 @@ pub struct Manifest {
     pub files: Vec<ManifestFile>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Member {
     pub id: u64,
     pub name: String,
@@ -92,6 +130,14 @@ pub struct FoundNetwork {
     /// The host's app version (display only).
     #[serde(rename = "appVersion")]
     pub app_version: String,
+    /// Whether the network requires a join code. `None` = the announce
+    /// didn't carry the field (host older than 0.1.9) → treat as unknown.
+    #[serde(rename = "requiresCode", skip_serializing_if = "Option::is_none")]
+    pub requires_code: Option<bool>,
+    /// When the last announce for this network arrived — entries silent
+    /// past TTL are dropped from the found list.
+    #[serde(skip_serializing)]
+    pub last_seen: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +232,9 @@ pub struct HostState {
     pub members: HashMap<u64, Member>,
     /// Kicked member ids — blocked from heartbeat until they rejoin.
     pub banned: HashSet<u64>,
+    /// Where connect.json lives — HTTP handlers persist roster changes
+    /// through it without needing the path threaded in.
+    pub store_path: PathBuf,
     pub stop: Arc<AtomicBool>,
 }
 
@@ -200,11 +249,23 @@ pub struct ClientState {
     pub declined: Vec<u64>,
     pub synced_dir: PathBuf,
     pub host_online: bool,
+    /// Consecutive failed host contacts — `host_online` only drops after
+    /// OFFLINE_MISSES in a row, so one congested beat can't flap the badge.
+    pub consec_failures: u32,
+    /// True while apply_update_progress is transferring — connect_status
+    /// skips its manifest poll so polls don't compete with the download.
+    pub applying: bool,
     /// Host kicked us — shown once, then the session is cleared.
     pub kicked: bool,
     pub member_views: Vec<MemberView>,
     pub latest_version: u64,
     pub latest_note: String,
+    /// rel path → (size, mtime secs, sha1) — diff_manifest skips re-hashing
+    /// files whose size+mtime haven't moved. In-memory only.
+    pub hash_memo: HashMap<String, (u64, u64, String)>,
+    /// Per-join token — the heartbeat task exits when this no longer
+    /// matches, so a rejoin can't leave two heartbeat loops running.
+    pub hb_token: u64,
 }
 
 pub type SharedHost = Arc<Mutex<Option<HostState>>>;
@@ -242,6 +303,10 @@ pub struct SavedHost {
     pub history: Vec<(u64, String, u64)>,
     #[serde(default)]
     pub banned: Vec<u64>,
+    /// The member roster — persisted so a host restart doesn't wipe the
+    /// table; offline members reappear as offline instead of vanishing.
+    #[serde(default)]
+    pub members: Vec<Member>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +363,7 @@ fn save_host(store_path: &Path, h: &HostState) {
         counter: h.counter,
         history: h.history.clone(),
         banned: h.banned.iter().copied().collect(),
+        members: h.members.values().cloned().collect(),
     });
     save_store(store_path, &store);
 }
@@ -334,18 +400,19 @@ fn clear_saved_client(store_path: &Path) {
 /// Hash all jars under `folder` into a manifest file list (relative paths).
 fn build_file_list(folder: &Path) -> Result<Vec<ManifestFile>> {
     let res = scanner::scan_folder_progress(&folder.to_string_lossy(), |_, _| {})?;
-    let mut files: Vec<ManifestFile> = res
-        .mods
-        .iter()
-        .filter_map(|m| {
-            let rel = Path::new(&m.path).strip_prefix(folder).ok()?;
-            Some(ManifestFile {
-                path: rel.to_string_lossy().replace('\\', "/"),
-                sha1: m.sha1.clone(),
-                size: m.size,
-            })
-        })
-        .collect();
+    let mut files: Vec<ManifestFile> = Vec::with_capacity(res.mods.len());
+    for m in &res.mods {
+        let Ok(rel) = Path::new(&m.path).strip_prefix(folder) else { continue };
+        // Scanner leaves sha1 empty only when the file couldn't be opened —
+        // hash it here so the error surfaces at publish instead of shipping
+        // a manifest members can never verify.
+        let sha1 = if m.sha1.is_empty() { sha1_file(Path::new(&m.path))? } else { m.sha1.clone() };
+        files.push(ManifestFile {
+            path: rel.to_string_lossy().replace('\\', "/"),
+            sha1,
+            size: m.size,
+        });
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
@@ -441,6 +508,7 @@ pub fn host_start(
         counter: 0,
         members: HashMap::new(),
         banned: HashSet::new(),
+        store_path: store_path.to_path_buf(),
         stop: stop.clone(),
     };
     *hs.lock().unwrap() = Some(st);
@@ -450,11 +518,17 @@ pub fn host_start(
         anyhow::bail!("can't bind port {HTTP_PORT} — another instance is using it");
     }
     let ann_state = hs.clone();
-    std::thread::spawn(move || announce_loop(ann_state));
+    let ann_stop = stop.clone();
+    std::thread::spawn(move || announce_loop(ann_state, ann_stop));
 
     if let Some(h) = hs.lock().unwrap().as_ref() {
         save_host(store_path, h);
     }
+    crate::alog!(
+        "host",
+        "hosting \"{name}\" — {n_files} file(s) staged{code_str}",
+        code_str = if code.is_empty() { ", open network" } else { ", join code set" }
+    );
     Ok(format!(
         "✓ hosting \"{name}\" — {n_files} file(s) staged, nothing published yet (code: {code})"
     ))
@@ -463,7 +537,7 @@ pub fn host_start(
 /// Re-host after an app restart: restores the last saved host verbatim —
 /// same network id, same manifest, same version counter. Never re-hashes or
 /// republishes the folder; members see exactly what was published before.
-fn host_resume(hs: &SharedHost, saved: &SavedHost) -> Result<()> {
+fn host_resume(hs: &SharedHost, store_path: &Path, saved: &SavedHost) -> Result<()> {
     if hs.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -491,14 +565,28 @@ fn host_resume(hs: &SharedHost, saved: &SavedHost) -> Result<()> {
         targets: HashMap::new(),
         counter: saved.counter,
         history: saved.history.clone(),
-        members: HashMap::new(),
+        // Restore the roster — offline members come back as offline rows
+        // instead of vanishing until they heartbeat again.
+        members: saved
+            .members
+            .iter()
+            .map(|m| (m.id, m.clone()))
+            .collect(),
         banned: saved.banned.iter().copied().collect(),
+        store_path: store_path.to_path_buf(),
         stop: stop.clone(),
     });
     // Retry-bind happens inside announce_loop if the port is busy right now.
     let _ = ensure_server(hs);
     let ann_state = hs.clone();
-    std::thread::spawn(move || announce_loop(ann_state));
+    let ann_stop = stop.clone();
+    std::thread::spawn(move || announce_loop(ann_state, ann_stop));
+    crate::alog!(
+        "host",
+        "resumed \"{}\" — {} member(s) restored",
+        saved.name,
+        saved.members.len()
+    );
     Ok(())
 }
 
@@ -515,6 +603,12 @@ pub fn host_update(
     let h = g.as_mut().context("not hosting")?;
     h.name = if name.trim().is_empty() { "My Network".into() } else { name.trim().into() };
     h.code = code.to_string();
+    crate::alog!(
+        "host",
+        "network updated — \"{}\"{}",
+        h.name,
+        if h.code.is_empty() { " (open)" } else { " (join code set)" }
+    );
     save_host(store_path, h);
     Ok(format!(
         "✓ network updated — \"{}\"{}",
@@ -536,13 +630,32 @@ pub fn host_kick(hs: &SharedHost, store_path: &Path, member_id: u64) -> Result<S
     h.members.remove(&member_id);
     h.targets.remove(&member_id); // any pending targeted publish dies with them
     h.banned.insert(member_id);
+    crate::alog!("host", "kicked {name} ({member_id}) — banned until rejoin");
     save_host(store_path, h);
     Ok(format!("✓ kicked {name} — they can rejoin with the code"))
+}
+
+/// Remove a member row WITHOUT banning — for ghost rows left by members
+/// who left before /leave existed or whose ids changed across reinstalls.
+pub fn host_forget(hs: &SharedHost, store_path: &Path, member_id: u64) -> Result<String> {
+    let mut g = hs.lock().unwrap();
+    let h = g.as_mut().context("not hosting")?;
+    let name = h
+        .members
+        .get(&member_id)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| format!("member {member_id}"));
+    h.members.remove(&member_id);
+    h.targets.remove(&member_id);
+    crate::alog!("host", "forgot {name} ({member_id}) — not banned");
+    save_host(store_path, h);
+    Ok(format!("✓ forgot {name} — their row is gone"))
 }
 
 pub fn host_stop(hs: &SharedHost, store_path: &Path) {
     if let Some(h) = hs.lock().unwrap().take() {
         h.stop.store(true, Ordering::Relaxed);
+        crate::alog!("host", "hosting stopped");
     }
     clear_saved_host(store_path);
 }
@@ -611,6 +724,7 @@ pub fn host_publish(
                 m.files.len(),
                 if note.is_empty() { String::new() } else { format!(" — {note}") }
             );
+            crate::alog!("host", "published v{version} → {name} only — {} file(s)", m.files.len());
             save_host(store_path, h);
             Ok(out)
         }
@@ -623,6 +737,7 @@ pub fn host_publish(
                 h.manifest.files.len(),
                 if note.is_empty() { String::new() } else { format!(" — {note}") }
             );
+            crate::alog!("host", "published v{version} globally — {} file(s)", h.manifest.files.len());
             save_host(store_path, h);
             Ok(out)
         }
@@ -660,6 +775,7 @@ pub fn host_set_folder(hs: &SharedHost, store_path: &Path, folder: &str) -> Resu
     };
     h.folder = folder_path;
     let n = files.len();
+    crate::alog!("host", "share folder → {folder} ({n} file(s), {same}% same)");
     save_host(store_path, h);
     Ok((same as u32, n))
 }
@@ -833,21 +949,56 @@ fn handle_request(hs: &SharedHost, mut req: tiny_http::Request) {
             if !h.code.is_empty() && body_code != h.code && !code_ok {
                 return respond_json(req, 403, &serde_json::json!({"error": "bad join code"}));
             }
-            let member_id = v["memberId"].as_u64().unwrap_or_else(rand_u64);
+            // id 0 is reserved for the host row in member_views.
+            let member_id = v["memberId"]
+                .as_u64()
+                .unwrap_or_else(rand_u64)
+                .max(1);
             let name = v["name"].as_str().unwrap_or("member").to_string();
             // Rejoining clears a prior kick — the code is the gate again.
             h.banned.remove(&member_id);
-            h.members.insert(
-                member_id,
-                Member {
-                    id: member_id,
-                    name: name.clone(),
-                    last_seen: now_secs(),
-                    applied_version: 0,
-                    app_version: v["appVersion"].as_str().unwrap_or("").to_string(),
-                },
-            );
+            let appv = v["appVersion"].as_str().unwrap_or("").to_string();
+            if let Some(m) = h.members.get_mut(&member_id) {
+                // Same member rejoining — merge: refresh identity fields but
+                // keep applied_version so they don't look "behind" until the
+                // next heartbeat reports their real state.
+                m.name = name.clone();
+                m.last_seen = now_secs();
+                m.app_version = appv;
+                crate::alog!("net", "member rejoin: {name} ({member_id})");
+            } else {
+                h.members.insert(
+                    member_id,
+                    Member {
+                        id: member_id,
+                        name: name.clone(),
+                        last_seen: now_secs(),
+                        applied_version: 0,
+                        app_version: appv,
+                    },
+                );
+                crate::alog!("net", "member joined: {name} ({member_id})");
+            }
+            let sp = h.store_path.clone();
+            save_host(&sp, h);
             respond_json(req, 200, &serde_json::json!({"ok": true, "memberId": member_id}))
+        }
+        ("POST", "/leave") => {
+            // Member sign-off — remove their row + any targeted publish.
+            let mid = member_header(&req);
+            let mut g = hs.lock().unwrap();
+            let Some(h) = g.as_mut() else {
+                return respond_json(req, 404, &serde_json::json!({"error": "gone"}));
+            };
+            if let Some(mid) = mid {
+                if let Some(m) = h.members.remove(&mid) {
+                    h.targets.remove(&mid);
+                    crate::alog!("net", "member left: {} ({mid})", m.name);
+                    let sp = h.store_path.clone();
+                    save_host(&sp, h);
+                }
+            }
+            respond_json(req, 200, &serde_json::json!({"ok": true}))
         }
         _ if !code_ok => {
             respond_json(req, 403, &serde_json::json!({"error": "bad join code"}))
@@ -884,13 +1035,74 @@ fn handle_request(hs: &SharedHost, mut req: tiny_http::Request) {
                 return respond_json(req, 400, &serde_json::json!({"error": "bad path"}));
             };
             match std::fs::File::open(&dest) {
-                Ok(f) => {
-                    let resp = tiny_http::Response::from_file(f).with_header(
+                Ok(mut f) => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    // Range: bytes=N- → resume a .part from its offset.
+                    let mut start = 0u64;
+                    let mut ranged = false;
+                    for hdr in req.headers() {
+                        if hdr.field.equiv("Range") {
+                            if let Some(v) = hdr.value.as_str().strip_prefix("bytes=") {
+                                if let Some((a, _)) = v.split_once('-') {
+                                    if let Ok(n) = a.trim().parse::<u64>() {
+                                        start = n;
+                                        ranged = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if ranged && start >= len {
+                        let resp = tiny_http::Response::empty(416).with_header(
+                            tiny_http::Header::from_bytes(
+                                &b"Content-Range"[..],
+                                format!("bytes */{len}").as_bytes(),
+                            )
+                            .unwrap(),
+                        );
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                    if ranged {
+                        let _ = f.seek(SeekFrom::Start(start));
+                    }
+                    let remaining = len - start;
+                    let mut headers = vec![
                         tiny_http::Header::from_bytes(
                             &b"Content-Type"[..],
                             &b"application/octet-stream"[..],
                         )
                         .unwrap(),
+                        tiny_http::Header::from_bytes(
+                            &b"Accept-Ranges"[..],
+                            &b"bytes"[..],
+                        )
+                        .unwrap(),
+                    ];
+                    if ranged {
+                        headers.push(
+                            tiny_http::Header::from_bytes(
+                                &b"Content-Range"[..],
+                                format!("bytes {start}-{}/{len}", len.saturating_sub(1))
+                                    .as_bytes(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    let reader =
+                        std::io::BufReader::with_capacity(1 << 20, f).take(remaining);
+                    let resp = tiny_http::Response::new(
+                        tiny_http::StatusCode(if ranged { 206 } else { 200 }),
+                        headers,
+                        reader,
+                        Some(remaining as usize),
+                        None,
+                    );
+                    crate::alog!(
+                        "xfer",
+                        "serve {rel} — {remaining}B{rs}",
+                        rs = if ranged { format!(" (resume@{start})") } else { String::new() }
                     );
                     let _ = req.respond(resp);
                 }
@@ -920,21 +1132,29 @@ fn handle_request(hs: &SharedHost, mut req: tiny_http::Request) {
                 let name = v["name"].as_str().unwrap_or("member").to_string();
                 let applied = v["appliedVersion"].as_u64().unwrap_or(0);
                 let appv = v["appVersion"].as_str().unwrap_or("").to_string();
-                h.members
-                    .entry(mid)
-                    .and_modify(|m| {
-                        m.last_seen = now_secs();
-                        m.applied_version = applied;
-                        m.name = name.clone();
-                        m.app_version = appv.clone();
-                    })
-                    .or_insert(Member {
-                        id: mid,
-                        name,
-                        last_seen: now_secs(),
-                        applied_version: applied,
-                        app_version: appv,
-                    });
+                if h.members.contains_key(&mid) {
+                    let m = h.members.get_mut(&mid).unwrap();
+                    m.last_seen = now_secs();
+                    m.applied_version = applied;
+                    m.name = name.clone();
+                    m.app_version = appv.clone();
+                } else {
+                    // A heartbeat is enough to re-register — roster survives
+                    // this insert via save_host, so restarts keep the row.
+                    h.members.insert(
+                        mid,
+                        Member {
+                            id: mid,
+                            name: name.clone(),
+                            last_seen: now_secs(),
+                            applied_version: applied,
+                            app_version: appv,
+                        },
+                    );
+                    crate::alog!("net", "member re-registered via heartbeat: {name} ({mid})");
+                    let sp = h.store_path.clone();
+                    save_host(&sp, h);
+                }
                 // Applied a targeted update → retire it; the member is back on
                 // the global stream.
                 if let Some(t) = h.targets.get(&mid) {
@@ -1004,23 +1224,32 @@ pub fn broadcast_targets() -> Vec<Ipv4Addr> {
     out
 }
 
-fn announce_loop(hs: SharedHost) {
+/// `stop` is captured from THIS host instance — a task from a previous
+/// hosting session must die even if `hs` already holds a new HostState
+/// (a quick stop→start would otherwise leave two announcers running).
+fn announce_loop(hs: SharedHost, stop: Arc<AtomicBool>) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return,
     };
     let _ = sock.set_broadcast(true);
     loop {
-        std::thread::sleep(Duration::from_secs(2));
+        // Slowed — not stopped — while the window hides in the tray:
+        // peers can still find and reach this host.
+        std::thread::sleep(Duration::from_secs(if APP_HIDDEN.load(Ordering::Relaxed) {
+            15
+        } else {
+            2
+        }));
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         // Retry-bind in case the port was busy when hosting (re)started.
         if !server_running() {
             let _ = ensure_server(&hs);
         }
         let g = hs.lock().unwrap();
         let Some(h) = g.as_ref() else { return };
-        if h.stop.load(Ordering::Relaxed) {
-            return;
-        }
         let msg = serde_json::json!({
             "magic": "MMPK1",
             "networkId": h.network_id,
@@ -1030,6 +1259,7 @@ fn announce_loop(hs: SharedHost) {
             "port": HTTP_PORT,
             "latestVersion": h.manifest.version,
             "members": h.members.len(),
+            "requiresCode": !h.code.is_empty(),
             "appVersion": env!("CARGO_PKG_VERSION"),
         })
         .to_string();
@@ -1102,6 +1332,8 @@ pub fn start_discovery_listener() {
                 latest_version: v["latestVersion"].as_u64().unwrap_or(0),
                 members: v["members"].as_u64().unwrap_or(0) as usize,
                 app_version: v["appVersion"].as_str().unwrap_or("").to_string(),
+                requires_code: v["requiresCode"].as_bool(),
+                last_seen: now_secs(),
             };
             if !f.network_id.is_empty() {
                 let mut m = found_map().lock().unwrap();
@@ -1128,14 +1360,25 @@ pub fn start_discovery_listener() {
 
 pub fn found_networks() -> Vec<FoundNetwork> {
     start_discovery_listener();
-    let mut v: Vec<FoundNetwork> = found_map()
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
+    let now = now_secs();
+    let mut m = found_map().lock().unwrap();
+    // Dead hosts stop announcing — their entries must die too, or the
+    // found list fills with networks that will never answer a join.
+    let before = m.len();
+    m.retain(|_, f| now.saturating_sub(f.last_seen) <= FOUND_TTL_SECS);
+    if m.len() != before {
+        crate::alog!("net", "dropped {} stale found entr(ies)", before - m.len());
+    }
+    let mut v: Vec<FoundNetwork> = m.values().cloned().collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+/// Sandbox hook — inject a found entry with a chosen last_seen so TTL
+/// expiry can be asserted without waiting on real announces.
+#[doc(hidden)]
+pub fn found_insert_for_test(f: FoundNetwork) {
+    found_map().lock().unwrap().insert(f.network_id.clone(), f);
 }
 
 /// Re-resolve a joined host's address from the latest announce (IP may change).
@@ -1179,12 +1422,26 @@ pub async fn join_network(
         .context("host returned error")?
         .json()
         .await?;
-    let member_id = rand_u64();
+    let network_id = info["networkId"].as_str().unwrap_or("").to_string();
+    // Rejoining the SAME network reuses the saved member id — a fresh id
+    // would mint a duplicate roster row on the host. Its applied_version
+    // restores too so files already on disk don't look pending.
+    let saved = load_store(store_path).client;
+    let same_net = saved
+        .as_ref()
+        .map(|s| s.network_id == network_id)
+        .unwrap_or(false);
+    let member_id = saved
+        .as_ref()
+        .filter(|_| same_net)
+        .map(|s| s.member_id.max(1))
+        .unwrap_or_else(|| rand_u64().max(1));
     let res = http
         .post(format!("http://{addr}/join"))
         .header(CODE_HEADER, code)
         .json(&serde_json::json!({
-            "code": code, "memberId": member_id, "name": display_name
+            "code": code, "memberId": member_id, "name": display_name,
+            "appVersion": env!("CARGO_PKG_VERSION")
         }))
         .timeout(Duration::from_secs(5))
         .send()
@@ -1193,32 +1450,77 @@ pub async fn join_network(
     if res.status() == reqwest::StatusCode::FORBIDDEN {
         anyhow::bail!("wrong join code");
     }
-    res.error_for_status().context("join rejected")?;
+    let res = res.error_for_status().context("join rejected")?;
+    // The host may override the id (e.g. merge/reshuffle) — adopt it.
+    let member_id = res
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v["memberId"].as_u64())
+        .unwrap_or(member_id)
+        .max(1);
 
-    let network_id = info["networkId"].as_str().unwrap_or("").to_string();
+    // Switching networks? Tell the old host we're leaving before replacing
+    // the session — otherwise our row ghosts on their member list forever.
+    let old_leave = {
+        let g = cs.lock().unwrap();
+        g.as_ref().and_then(|old| {
+            (old.network_id != network_id).then(|| {
+                (old.host_addr.clone(), old.code.clone(), old.member_id)
+            })
+        })
+    };
+
     let synced_dir = synced_root.join(&network_id);
     std::fs::create_dir_all(synced_dir.join("mods"))?;
 
     {
         let mut g = cs.lock().unwrap();
         *g = Some(ClientState {
-            network_id,
+            network_id: network_id.clone(),
             network_name: info["name"].as_str().unwrap_or("?").to_string(),
             host_addr: addr.to_string(),
             code: code.to_string(),
             member_id,
             display_name: display_name.to_string(),
-            applied_version: 0,
-            declined: vec![],
+            applied_version: saved
+                .as_ref()
+                .filter(|_| same_net)
+                .map(|s| s.applied_version)
+                .unwrap_or(0),
+            declined: saved
+                .as_ref()
+                .filter(|_| same_net)
+                .map(|s| s.declined.clone())
+                .unwrap_or_default(),
             synced_dir,
             host_online: true,
+            consec_failures: 0,
+            applying: false,
             kicked: false,
             member_views: vec![],
             latest_version: info["latestVersion"].as_u64().unwrap_or(0),
             latest_note: String::new(),
+            hash_memo: HashMap::new(),
+            hb_token: rand_u64(),
         });
         save_client(store_path, g.as_ref().unwrap());
     }
+    if let Some((oa, oc, om)) = old_leave {
+        crate::alog!("net", "leaving previous network before rejoin");
+        let _ = http
+            .post(format!("http://{oa}/leave"))
+            .header(CODE_HEADER, oc)
+            .header(MEMBER_HEADER, om.to_string())
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+    }
+    crate::alog!(
+        "net",
+        "joined \"{}\" ({network_id}) as {display_name} ({member_id})",
+        info["name"].as_str().unwrap_or("?")
+    );
     spawn_heartbeat(cs.clone());
     Ok(format!(
         "✓ joined \"{}\" — latest version: v{}",
@@ -1227,13 +1529,65 @@ pub async fn join_network(
     ))
 }
 
+/// One heartbeat POST — shared by the loop and the banned-member probe.
+async fn heartbeat_once(
+    http: &reqwest::Client,
+    addr: &str,
+    code: &str,
+    mid: u64,
+    name: &str,
+    applied: u64,
+) -> Option<serde_json::Value> {
+    let r = http
+        .post(format!("http://{addr}/heartbeat"))
+        .header(CODE_HEADER, code)
+        .header(MEMBER_HEADER, mid.to_string())
+        .json(&serde_json::json!({
+            "memberId": mid, "name": name, "appliedVersion": applied,
+            "appVersion": env!("CARGO_PKG_VERSION")
+        }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    r.json().await.ok()
+}
+
+/// Track consecutive host-contact results — `host_online` only drops
+/// after OFFLINE_MISSES straight misses so one lost beat can't flap it.
+fn mark_host_contact(cs: &SharedClient, ok: bool) {
+    if let Some(c) = cs.lock().unwrap().as_mut() {
+        if ok {
+            c.consec_failures = 0;
+            c.host_online = true;
+        } else {
+            c.consec_failures = c.consec_failures.saturating_add(1);
+            if c.consec_failures >= OFFLINE_MISSES {
+                c.host_online = false;
+            }
+        }
+    }
+}
+
 fn spawn_heartbeat(cs: SharedClient) {
+    let my_token = cs
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.hb_token)
+        .unwrap_or(0);
     tokio::spawn(async move {
         let http = reqwest::Client::new();
         loop {
             let (addr, code, mid, name, applied, nid) = {
                 let g = cs.lock().unwrap();
                 let Some(c) = g.as_ref() else { return };
+                if c.hb_token != my_token {
+                    return; // a newer join spawned a newer heartbeat loop
+                }
                 (
                     c.host_addr.clone(),
                     c.code.clone(),
@@ -1243,34 +1597,21 @@ fn spawn_heartbeat(cs: SharedClient) {
                     c.network_id.clone(),
                 )
             };
-            let res = http
-                .post(format!("http://{addr}/heartbeat"))
-                .header(CODE_HEADER, &code)
-                .header(MEMBER_HEADER, mid.to_string())
-                .json(&serde_json::json!({
-                    "memberId": mid, "name": name, "appliedVersion": applied,
-                    "appVersion": env!("CARGO_PKG_VERSION")
-                }))
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await;
-            // Fully resolve the response before locking — MutexGuard isn't Send.
-            let parsed: Option<serde_json::Value> = match res {
-                Ok(r) if r.status().is_success() => r.json().await.ok(),
-                _ => None,
-            };
+            let parsed = heartbeat_once(&http, &addr, &code, mid, &name, applied).await;
             {
                 let mut g = cs.lock().unwrap();
                 let Some(c) = g.as_mut() else { return };
-                if c.network_id != nid {
+                if c.hb_token != my_token || c.network_id != nid {
                     return;
                 }
                 match parsed {
                     Some(v) => {
                         if v["kicked"] == true {
                             c.kicked = true;
+                            crate::alog!("net", "heartbeat → kicked by host");
                             return; // stop heartbeating; status clears the session
                         }
+                        c.consec_failures = 0;
                         c.host_online = true;
                         if let Some(n) = v["networkName"].as_str() {
                             c.network_name = n.to_string();
@@ -1288,20 +1629,42 @@ fn spawn_heartbeat(cs: SharedClient) {
                             })
                             .unwrap_or_default();
                     }
-                    None => c.host_online = false,
+                    None => {
+                        c.consec_failures = c.consec_failures.saturating_add(1);
+                        if c.consec_failures >= OFFLINE_MISSES {
+                            c.host_online = false;
+                        }
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECS)).await;
+            // Presence must survive efficiency mode — slowed, not stopped.
+            tokio::time::sleep(Duration::from_secs(
+                if APP_HIDDEN.load(Ordering::Relaxed) {
+                    60
+                } else {
+                    HEARTBEAT_SECS
+                },
+            ))
+            .await;
         }
     });
 }
 
-pub fn leave_network(cs: &SharedClient, store_path: &Path) {
-    // Take the session and drop its synced mirror — everything in it is
+pub async fn leave_network(cs: &SharedClient, http: &reqwest::Client, store_path: &Path) {
+    // Tell the host first (best-effort) so our row doesn't ghost, then
+    // take the session and drop its synced mirror — everything in it is
     // re-downloadable, so leaving shouldn't leave a dead copy on disk.
-    let dir = cs.lock().unwrap().take().map(|c| c.synced_dir);
-    if let Some(d) = dir {
-        let _ = std::fs::remove_dir_all(&d);
+    let old = cs.lock().unwrap().take();
+    if let Some(c) = &old {
+        crate::alog!("net", "leaving \"{}\" ({})", c.network_name, c.network_id);
+        let _ = http
+            .post(format!("http://{}/leave", c.host_addr))
+            .header(CODE_HEADER, &c.code)
+            .header(MEMBER_HEADER, c.member_id.to_string())
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+        let _ = std::fs::remove_dir_all(&c.synced_dir);
     }
     clear_saved_client(store_path);
 }
@@ -1339,9 +1702,26 @@ pub async fn check_pending(
     {
         Ok(m) => m,
         Err(e) => {
-            // Can't reach the host (down OR not hosting) — mark offline.
-            if let Some(c) = cs.lock().unwrap().as_mut() {
-                c.host_online = false;
+            mark_host_contact(cs, false);
+            // A kicked member gets 403 on /manifest — probe the heartbeat
+            // endpoint once so "you were kicked" lands immediately instead
+            // of masquerading as an unreachable host until the next beat.
+            let (name, applied_v) = {
+                let g = cs.lock().unwrap();
+                match g.as_ref() {
+                    Some(c) => (c.display_name.clone(), c.applied_version),
+                    None => return Err(e).context("host unreachable"),
+                }
+            };
+            if let Some(v) =
+                heartbeat_once(http, &addr, &code, mid, &name, applied_v).await
+            {
+                if v["kicked"] == true {
+                    if let Some(c) = cs.lock().unwrap().as_mut() {
+                        c.kicked = true;
+                    }
+                    crate::alog!("net", "manifest 403 → heartbeat probe → kicked");
+                }
             }
             return Err(e).context("host unreachable");
         }
@@ -1349,6 +1729,7 @@ pub async fn check_pending(
     {
         let mut g = cs.lock().unwrap();
         if let Some(c) = g.as_mut() {
+            c.consec_failures = 0;
             c.host_online = true;
             c.latest_version = manifest.version;
             c.latest_note = manifest.note.clone();
@@ -1357,21 +1738,56 @@ pub async fn check_pending(
     if manifest.version <= applied || declined.contains(&manifest.version) {
         return Ok(None);
     }
-    let (to_dl, to_del) = diff_manifest(&dir.join("mods"), &manifest);
+    let (to_dl, to_del) = {
+        let mut g = cs.lock().unwrap();
+        match g.as_mut() {
+            Some(c) => diff_manifest(&dir.join("mods"), &manifest, &mut c.hash_memo),
+            None => (0, 0),
+        }
+    };
     Ok(Some((manifest, to_dl, to_del)))
 }
 
 /// Which files need downloading / deleting to mirror `manifest` in `dir`.
-fn diff_manifest(dir: &Path, manifest: &Manifest) -> (usize, usize) {
+/// `memo` lets an unchanged file (same size+mtime) skip its re-hash — the
+/// every-4s status poll otherwise sha1s the entire synced folder forever.
+fn diff_manifest(
+    dir: &Path,
+    manifest: &Manifest,
+    memo: &mut HashMap<String, (u64, u64, String)>,
+) -> (usize, usize) {
+    let mtime_secs = |p: &Path| -> u64 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
     let mut to_dl = 0;
     for f in &manifest.files {
         let Some(local) = safe_rel(dir, &f.path) else { continue };
-        let ok = local
-            .is_file()
-            .then(|| sha1_file(&local).ok())
-            .flatten()
-            .map(|h| h == f.sha1)
-            .unwrap_or(false);
+        if !local.is_file() {
+            to_dl += 1;
+            continue;
+        }
+        let size = local.metadata().map(|m| m.len()).unwrap_or(0);
+        let mt = mtime_secs(&local);
+        let ok = if memo
+            .get(&f.path)
+            .map(|(s, m, h)| *s == size && *m == mt && h == &f.sha1)
+            .unwrap_or(false)
+        {
+            true
+        } else {
+            match sha1_file(&local) {
+                Ok(h) => {
+                    memo.insert(f.path.clone(), (size, mt, h.clone()));
+                    h == f.sha1
+                }
+                Err(_) => false,
+            }
+        };
         if !ok {
             to_dl += 1;
         }
@@ -1411,29 +1827,302 @@ pub async fn apply_update(
     http: &reqwest::Client,
     store_path: &Path,
 ) -> Result<String> {
-    apply_update_progress(cs, http, store_path, |_, _, _, _, _| {}).await
+    apply_update_progress(cs, http, store_path, |_| {}).await
 }
 
-/// Same, with live progress: `(file idx, total files, rel path, bytes done,
-/// bytes total)` per chunk — the UI shows a real bar instead of looking frozen.
+/// Per-file live state inside `ApplyProgress.files`.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ApplyFileProgress {
+    pub name: String,
+    pub done: u64,
+    pub total: u64,
+    pub retries: u32,
+}
+
+/// Rich apply progress — phase ("hashing" | "downloading" | "done" |
+/// "cancelled" | "failed"), aggregate byte counts, every in-flight file,
+/// and the names of files that exhausted their retries.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ApplyProgress {
+    pub phase: String,
+    #[serde(rename = "doneFiles")]
+    pub done_files: usize,
+    #[serde(rename = "totalFiles")]
+    pub total_files: usize,
+    #[serde(rename = "doneBytes")]
+    pub done_bytes: u64,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: u64,
+    #[serde(rename = "hashingDone")]
+    pub hashing_done: usize,
+    #[serde(rename = "hashingTotal")]
+    pub hashing_total: usize,
+    #[serde(rename = "hashingFile")]
+    pub hashing_file: String,
+    pub files: Vec<ApplyFileProgress>,
+    pub failed: Vec<String>,
+}
+
+/// Clears the `applying` flag on every exit path — an apply in flight
+/// tells connect_status to skip its manifest poll.
+struct ApplyGuard<'a>(&'a SharedClient);
+impl Drop for ApplyGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.lock().unwrap().as_mut() {
+            c.applying = false;
+        }
+    }
+}
+
+/// One file's retry+resume loop. `.part` holds downloaded bytes; a Range
+/// request picks up where it left off; sha1 on the WHOLE file gates the
+/// rename — a corrupt prefix fails the check and restarts clean.
+async fn download_one(
+    cs: &SharedClient,
+    http: &reqwest::Client,
+    code: &str,
+    mid: u64,
+    mods_dir: &Path,
+    f: &ManifestFile,
+    shared: &Arc<Mutex<ApplyProgress>>,
+    emit: &(dyn Fn(bool) + Sync),
+) -> std::result::Result<(), String> {
+    use std::io::Write;
+    let local = safe_rel(mods_dir, &f.path)
+        .ok_or_else(|| format!("bad path {}", f.path))?;
+    let tmp = local.with_extension("part");
+    if let Some(p) = tmp.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    // Register this file's row in the shared progress state.
+    let fi = {
+        let mut s = shared.lock().unwrap();
+        s.files.push(ApplyFileProgress {
+            name: f.path.clone(),
+            done: 0,
+            total: f.size,
+            retries: 0,
+        });
+        s.files.len() - 1
+    };
+
+    let mut last_err = String::from("no attempts");
+    for attempt in 1..=FILE_RETRIES {
+        if APPLY_CANCEL.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let resume_at = tmp
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0)
+            .min(f.size);
+        {
+            let mut s = shared.lock().unwrap();
+            s.files[fi].retries = (attempt - 1) as u32;
+            s.files[fi].done = resume_at;
+        }
+        emit(true); // file-start is a boundary — always visible
+        crate::alog!(
+            "xfer",
+            "file {} — attempt {attempt}/{FILE_RETRIES}{}",
+            f.path,
+            if resume_at > 0 { format!(" resume@{resume_at}") } else { String::new() }
+        );
+
+        // Re-resolve the host addr between attempts — VPN IPs move.
+        let addr = {
+            let mut g = cs.lock().unwrap();
+            g.as_mut()
+                .map(|c| {
+                    refresh_host_addr(c);
+                    c.host_addr.clone()
+                })
+                .unwrap_or_default()
+        };
+        if addr.is_empty() {
+            last_err = "session gone".into();
+            break;
+        }
+        let t0 = std::time::Instant::now();
+        let mut req = http
+            .get(format!("http://{addr}/file?path={}", url_encode(&f.path)))
+            .header(CODE_HEADER, code)
+            .header(MEMBER_HEADER, mid.to_string())
+            .timeout(Duration::from_secs(FILE_TIMEOUT_SECS));
+        if resume_at > 0 {
+            req = req.header("Range", format!("bytes={resume_at}-"));
+        }
+        let mut resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("connect: {e}");
+                crate::alog!("xfer", "file {} — {last_err}", f.path);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = format!("http {}", resp.status());
+            crate::alog!("xfer", "file {} — {last_err}", f.path);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        // Server honoured Range only via 206 — a 200 (old host) restarts
+        // the file from zero; never append a full body to a .part.
+        let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT && resume_at > 0;
+        let start = if resumed { resume_at } else { 0 };
+        let mut hasher = sha1::Sha1::new();
+        if resumed {
+            // Hash the already-downloaded prefix so the final digest covers
+            // the whole file — without this a resumed file can never verify.
+            match std::fs::File::open(&tmp) {
+                Ok(pf) => {
+                    let mut rd = std::io::BufReader::new(pf);
+                    let _ = std::io::copy(&mut rd, &mut hasher);
+                }
+                Err(e) => {
+                    last_err = format!("part read: {e}");
+                    continue;
+                }
+            }
+        }
+        let mut tmpf = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(resumed)
+            .truncate(!resumed)
+            .open(&tmp)
+        {
+            Ok(fh) => fh,
+            Err(e) => {
+                last_err = format!("part open: {e}");
+                continue;
+            }
+        };
+        let mut got = start;
+        let mut stream_err: Option<String> = None;
+        loop {
+            if APPLY_CANCEL.load(Ordering::Relaxed) {
+                stream_err = Some("cancelled".into());
+                break;
+            }
+            // Stall guard: no chunk for CHUNK_TIMEOUT_SECS → this attempt
+            // is dead, retry resumes from the .part offset.
+            let next = tokio::time::timeout(
+                Duration::from_secs(CHUNK_TIMEOUT_SECS),
+                resp.chunk(),
+            )
+            .await;
+            match next {
+                Err(_) => {
+                    stream_err = Some("stalled (no data for 60s)".into());
+                    break;
+                }
+                Ok(Err(e)) => {
+                    stream_err = Some(format!("stream: {e}"));
+                    break;
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => {
+                    if tmpf.write_all(&chunk).is_err() {
+                        stream_err = Some("disk write failed".into());
+                        break;
+                    }
+                    hasher.update(&chunk);
+                    got += chunk.len() as u64;
+                    {
+                        let mut s = shared.lock().unwrap();
+                        s.files[fi].done = got;
+                    }
+                    emit(false);
+                }
+            }
+        }
+        drop(tmpf);
+        if let Some(se) = stream_err {
+            last_err = se;
+            crate::alog!("xfer", "file {} — {last_err} at {got}B", f.path);
+            if last_err == "cancelled" {
+                return Err("cancelled".into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        if got != f.size {
+            last_err = format!("short body ({got}/{})", f.size);
+            crate::alog!("xfer", "file {} — {last_err}", f.path);
+            continue;
+        }
+        if hex::encode(hasher.finalize()) != f.sha1 {
+            // Corrupt bytes — a .part we can't trust can't be resumed.
+            let _ = std::fs::remove_file(&tmp);
+            {
+                let mut s = shared.lock().unwrap();
+                s.files[fi].done = 0;
+            }
+            last_err = "sha1 mismatch".into();
+            crate::alog!("xfer", "file {} — sha1 mismatch, restarting", f.path);
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &local) {
+            last_err = format!("rename: {e}");
+            continue;
+        }
+        {
+            let mut s = shared.lock().unwrap();
+            s.files[fi].done = f.size;
+            s.done_files += 1;
+        }
+        let ms = t0.elapsed().as_millis().max(1);
+        crate::alog!(
+            "xfer",
+            "file {} — done {}B in {}ms ({:.1} MB/s)",
+            f.path,
+            f.size,
+            ms,
+            f.size as f64 / (ms as f64 * 1000.0)
+        );
+        emit(true); // file-done boundary
+        return Ok(());
+    }
+    {
+        let mut s = shared.lock().unwrap();
+        s.failed.push(f.path.clone());
+    }
+    crate::alog!("xfer", "file {} — FAILED after retries: {last_err}", f.path);
+    Err(format!("{}: {last_err}", f.path))
+}
+
+/// Full apply engine: hashing phase → PARALLEL_FILES workers with
+/// per-file retry+Range-resume → sha1-verified rename → mirror sweep →
+/// pack.json. Cancellable; `.part` files survive for the next apply.
 pub async fn apply_update_progress(
     cs: &SharedClient,
     http: &reqwest::Client,
     store_path: &Path,
-    progress: impl Fn(usize, usize, &str, u64, u64),
+    progress: impl Fn(&ApplyProgress) + Sync,
 ) -> Result<String> {
-    let (addr, code, mid, dir, nid) = {
+    APPLY_CANCEL.store(false, Ordering::Relaxed);
+    let (code, mid, dir, nid) = {
         let mut g = cs.lock().unwrap();
         let c = g.as_mut().context("not joined to a network")?;
+        c.applying = true;
         refresh_host_addr(c);
         (
-            c.host_addr.clone(),
             c.code.clone(),
             c.member_id,
             c.synced_dir.clone(),
             c.network_id.clone(),
         )
     };
+    let _apply_guard = ApplyGuard(cs);
+    let addr = cs
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.host_addr.clone())
+        .unwrap_or_default();
+    crate::alog!("xfer", "apply start — fetching manifest from {addr}");
     let manifest: Manifest = http
         .get(format!("http://{addr}/manifest"))
         .header(CODE_HEADER, &code)
@@ -1445,17 +2134,46 @@ pub async fn apply_update_progress(
         .error_for_status()?
         .json()
         .await?;
+    crate::alog!(
+        "xfer",
+        "manifest v{} — {} file(s)",
+        manifest.version,
+        manifest.files.len()
+    );
 
     let mods_dir = dir.join("mods");
     std::fs::create_dir_all(&mods_dir)?;
     let mut log = String::new();
-    let mut downloaded = 0usize;
 
-    // Queue the files needing download up-front so progress has a total,
-    // then stream each straight to .part in chunks — memory stays flat on
-    // big jars and the UI gets per-chunk byte progress.
-    let mut queue: Vec<&ManifestFile> = Vec::new();
-    for f in &manifest.files {
+    let shared = Arc::new(Mutex::new(ApplyProgress {
+        phase: "hashing".into(),
+        hashing_total: manifest.files.len(),
+        ..Default::default()
+    }));
+    let last_emit = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
+    let emit = |force: bool| {
+        let mut t = last_emit.lock().unwrap();
+        if force || t.elapsed().as_millis() >= EMIT_MS {
+            *t = std::time::Instant::now();
+            let mut snap = shared.lock().unwrap().clone();
+            drop(t);
+            // Aggregate bytes = sum over every file row — resume offsets,
+            // restarts and parallel workers can't skew it.
+            snap.done_bytes = snap.files.iter().map(|x| x.done).sum();
+            progress(&snap);
+        }
+    };
+
+    // Hashing phase — sha1 every local file to build the queue. This used
+    // to be invisible UI-frozen seconds; now it reports like a transfer.
+    let mut queue: Vec<ManifestFile> = Vec::new();
+    for (i, f) in manifest.files.iter().enumerate() {
+        {
+            let mut s = shared.lock().unwrap();
+            s.hashing_done = i + 1;
+            s.hashing_file = f.path.clone();
+        }
+        emit(false);
         let Some(local) = safe_rel(&mods_dir, &f.path) else { continue };
         let ok = local
             .is_file()
@@ -1464,53 +2182,68 @@ pub async fn apply_update_progress(
             .map(|h| h == f.sha1)
             .unwrap_or(false);
         if !ok {
-            queue.push(f);
+            queue.push(f.clone());
         }
     }
-    let total_files = queue.len();
-
-    for (i, f) in queue.iter().enumerate() {
-        let Some(local) = safe_rel(&mods_dir, &f.path) else { continue };
-        let tmp = local.with_extension("part");
-        if let Some(p) = tmp.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        let mut resp = http
-            .get(format!(
-                "http://{addr}/file?path={}",
-                url_encode(&f.path)
-            ))
-            .header(CODE_HEADER, &code)
-            .header(MEMBER_HEADER, mid.to_string())
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .context("download failed")?
-            .error_for_status()?;
-        let total_b = resp.content_length().unwrap_or(0);
-        let mut tmpf = std::fs::File::create(&tmp)?;
-        let mut hasher = sha1::Sha1::new();
-        let mut got_b = 0u64;
-        progress(i, total_files, &f.path, 0, total_b);
-        while let Some(chunk) = resp.chunk().await.context("download interrupted")? {
-            std::io::Write::write_all(&mut tmpf, &chunk)?;
-            hasher.update(&chunk);
-            got_b += chunk.len() as u64;
-            progress(i, total_files, &f.path, got_b, total_b);
-        }
-        drop(tmpf);
-        if hex::encode(hasher.finalize()) != f.sha1 {
-            let _ = std::fs::remove_file(&tmp);
-            log.push_str(&format!("! hash mismatch on {}, skipped\n", f.path));
-            continue;
-        }
-        std::fs::rename(&tmp, &local)?;
-        downloaded += 1;
-        progress(i + 1, total_files, &f.path, total_b, total_b);
+    let total_bytes: u64 = queue.iter().map(|f| f.size).sum();
+    crate::alog!(
+        "xfer",
+        "queue built — {} to download, {}B total",
+        queue.len(),
+        total_bytes
+    );
+    {
+        let mut s = shared.lock().unwrap();
+        s.total_files = queue.len();
+        s.total_bytes = total_bytes;
+        s.hashing_file.clear();
+        s.phase = "downloading".into();
     }
-    log.push_str(&format!("✓ downloaded {} file(s)\n", downloaded));
+    emit(true);
 
-    // Mirror: remove local files not in the manifest.
+    if APPLY_CANCEL.load(Ordering::Relaxed) {
+        shared.lock().unwrap().phase = "cancelled".into();
+        emit(true);
+        return Ok("! cancelled — no files downloaded yet".into());
+    }
+
+    // Parallel workers — each file gets its own retry/resume loop.
+    use futures::stream::{self, StreamExt};
+    let results: Vec<std::result::Result<(), String>> = stream::iter(
+        queue.into_iter().map(|f| {
+            let (shared, emit, code, mods_dir) = (&shared, &emit, &code, &mods_dir);
+            async move {
+                download_one(cs, http, code, mid, mods_dir, &f, shared, emit)
+                    .await
+            }
+        }),
+    )
+    .buffer_unordered(PARALLEL_FILES)
+    .collect()
+    .await;
+    let failures: Vec<String> = results.into_iter().filter_map(|r| r.err()).collect();
+
+    if APPLY_CANCEL.load(Ordering::Relaxed)
+        || failures.iter().any(|f| f.contains("cancelled"))
+    {
+        shared.lock().unwrap().phase = "cancelled".into();
+        emit(true);
+        crate::alog!("xfer", "apply cancelled — .part files kept for resume");
+        return Ok("! cancelled — .part files kept; apply again to resume".into());
+    }
+    if !failures.is_empty() {
+        shared.lock().unwrap().phase = "failed".into();
+        emit(true);
+        crate::alog!("xfer", "apply failed — {} file(s): {}", failures.len(), failures.join(", "));
+        anyhow::bail!(
+            "{} file(s) failed to download — the rest are in place; apply again to retry:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    // Mirror: remove local files not in the manifest. `.part` files whose
+    // target IS in the manifest survive — they're resumable progress.
     let want: std::collections::HashSet<&str> =
         manifest.files.iter().map(|f| f.path.as_str()).collect();
     let mut removed = 0usize;
@@ -1527,7 +2260,9 @@ pub async fn apply_update_progress(
                         .map(|r| r.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_default();
                     if rel.ends_with(".part") {
-                        let _ = std::fs::remove_file(&p);
+                        if !want.contains(&rel[..rel.len() - 5]) {
+                            let _ = std::fs::remove_file(&p);
+                        }
                     } else if !want.contains(rel.as_str()) {
                         let _ = std::fs::remove_file(&p);
                         removed += 1;
@@ -1557,9 +2292,15 @@ pub async fn apply_update_progress(
         if let Some(c) = g.as_mut() {
             c.applied_version = manifest.version;
             c.declined.retain(|v| *v > manifest.version);
+            c.hash_memo.clear(); // contents changed — next diff re-hashes
             save_client(store_path, c);
         }
     }
+    {
+        let mut s = shared.lock().unwrap();
+        s.phase = "done".into();
+    }
+    emit(true);
 
     // Host may have republished mid-apply — if so, stay pending.
     if let Ok(Some((newer, _, _))) = check_pending(cs, http).await {
@@ -1568,9 +2309,11 @@ pub async fn apply_update_progress(
                 "! applied v{}, but v{} is already out — check again",
                 manifest.version, newer.version
             ));
+            crate::alog!("xfer", "applied v{} but v{} already out", manifest.version, newer.version);
             return Ok(log);
         }
     }
+    crate::alog!("xfer", "applied v{} complete", manifest.version);
     log.push_str(&format!(
         "✓ synced to v{} — pick a launcher below to install it",
         manifest.version
@@ -1769,7 +2512,7 @@ pub async fn connect_status(
         .map(|c| c.kicked)
         .unwrap_or(false);
     if kicked_now {
-        leave_network(cs, store_path);
+        leave_network(cs, http, store_path).await;
     }
     if let Some(h) = hs.lock().unwrap().as_ref() {
         let members = member_views(h);
@@ -1798,17 +2541,44 @@ pub async fn connect_status(
         });
     }
     if cs.lock().unwrap().is_some() {
-        let pending = check_pending(cs, http)
-            .await
-            .ok()
-            .flatten()
-            .map(|(m, dl, del)| PendingUpdate {
-                version: m.version,
-                note: m.note.clone(),
-                file_count: m.files.len(),
-                to_download: dl,
-                to_delete: del,
+        // Mid-apply: don't poll /manifest — the download is already
+        // saturating the link and the progress events carry the truth.
+        let applying = cs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.applying)
+            .unwrap_or(false);
+        let pending = if applying {
+            None
+        } else {
+            check_pending(cs, http)
+                .await
+                .ok()
+                .flatten()
+                .map(|(m, dl, del)| PendingUpdate {
+                    version: m.version,
+                    note: m.note.clone(),
+                    file_count: m.files.len(),
+                    to_download: dl,
+                    to_delete: del,
+                })
+        };
+        // The check_pending probe may have just learned we were kicked —
+        // clear the session now rather than next poll.
+        if cs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.kicked)
+            .unwrap_or(false)
+        {
+            leave_network(cs, http, store_path).await;
+            return Ok(ConnectStatus {
+                kicked: true,
+                ..idle_status()
             });
+        }
         let g = cs.lock().unwrap();
         let c = g.as_ref().unwrap();
         let members: Vec<MemberView> = c.member_views.clone();
@@ -1829,7 +2599,13 @@ pub async fn connect_status(
             kicked: false,
         });
     }
-    Ok(ConnectStatus {
+    let mut st = idle_status();
+    st.kicked = kicked_now;
+    Ok(st)
+}
+
+fn idle_status() -> ConnectStatus {
+    ConnectStatus {
         mode: "idle".into(),
         network_name: None,
         network_id: None,
@@ -1843,8 +2619,8 @@ pub async fn connect_status(
         display_name: None,
         members: vec![],
         pending: None,
-        kicked: kicked_now,
-    })
+        kicked: false,
+    }
 }
 
 /// Restore the last session: re-host (server + announce) or re-join
@@ -1857,12 +2633,13 @@ pub fn resume(
 ) {
     let store = load_store(store_path);
     if let Some(h) = store.host {
-        let _ = host_resume(hs, &h);
+        let _ = host_resume(hs, store_path, &h);
     }
     if let Some(c) = store.client {
         let mut g = cs.lock().unwrap();
         if g.is_none() {
             let synced_dir = synced_root.join(&c.network_id);
+            crate::alog!("net", "resumed client session \"{}\"", c.network_name);
             *g = Some(ClientState {
                 network_id: c.network_id,
                 network_name: c.network_name,
@@ -1874,13 +2651,43 @@ pub fn resume(
                 declined: c.declined,
                 synced_dir,
                 host_online: false,
+                consec_failures: 0,
+                applying: false,
                 kicked: false,
                 latest_version: 0,
                 latest_note: String::new(),
                 member_views: vec![],
+                hash_memo: HashMap::new(),
+                hb_token: rand_u64(),
             });
             drop(g);
             spawn_heartbeat(cs.clone());
         }
     }
+}
+
+/// Fetch `/info` for a manual-IP join — the UI uses `requiresCode` to
+/// decide whether to even show the code field.
+pub async fn network_info(
+    http: &reqwest::Client,
+    addr: &str,
+) -> Result<serde_json::Value> {
+    let addr_owned;
+    let addr = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        addr_owned = format!("{addr}:{HTTP_PORT}");
+        addr_owned
+    };
+    let v: serde_json::Value = http
+        .get(format!("http://{addr}/info"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("host unreachable")?
+        .error_for_status()
+        .context("host returned error")?
+        .json()
+        .await?;
+    Ok(v)
 }

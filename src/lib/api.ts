@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // ---- Types shared with the Rust backend ----
 
@@ -174,6 +175,8 @@ export interface FoundNetwork {
   latestVersion: number;
   members: number;
   appVersion: string; // the host's running app version (display only)
+  /** undefined = announce didn't say (host older than 0.1.9) — ask for code. */
+  requiresCode?: boolean;
 }
 
 export interface MemberView {
@@ -258,6 +261,10 @@ export const hostUpdate = (name: string, code: string) =>
 export const hostKick = (memberId: number) =>
   invoke<string>("host_kick", { memberId });
 
+/** Remove a member row without banning — for ghosts, not kicks. */
+export const hostForget = (memberId: number) =>
+  invoke<string>("host_forget", { memberId });
+
 export const hostStop = () => invoke<void>("host_stop");
 
 export const scanNetworks = () => invoke<FoundNetwork[]>("scan_networks");
@@ -267,18 +274,46 @@ export const joinNetwork = (addr: string, code: string, displayName: string) =>
 
 export const leaveNetwork = () => invoke<void>("leave_network");
 
+/** `/info` for a manual join — `requiresCode` decides the code field. */
+export const connectNetworkInfo = (addr: string) =>
+  invoke<{ requiresCode?: boolean; name?: string }>("connect_network_info", { addr });
+
 export const connectStatus = () => invoke<ConnectStatus>("connect_status");
 
 export const applyUpdate = () => invoke<string>("apply_update");
 
+/** Stop the running apply — .part files survive for the next resume. */
+export const cancelApply = () => invoke<void>("cancel_apply");
+
 /** Live payload of the "connect-apply-progress" event during apply. */
-export interface ApplyProgress {
-  done: number;      // files finished
-  total: number;     // files queued
-  name: string;      // current file (relative path)
-  doneBytes: number; // bytes received for the current file
-  totalBytes: number;
+export interface ApplyFileProgress {
+  name: string;
+  done: number;
+  total: number;
+  retries: number;
 }
+
+export interface ApplyProgress {
+  phase: "hashing" | "downloading" | "done" | "cancelled" | "failed";
+  doneFiles: number;
+  totalFiles: number;
+  doneBytes: number;
+  totalBytes: number;
+  hashingDone: number;
+  hashingTotal: number;
+  hashingFile: string;
+  files: ApplyFileProgress[];
+  failed: string[];
+}
+
+// ---- Session logs ----
+
+export const openLogsDir = () => invoke<void>("open_logs_dir");
+
+export const tailLog = (n = 200) => invoke<string[]>("tail_log", { n });
+
+/** Mirrors the tray's hidden flag so views can pause their polls. */
+export const appHidden = { current: false };
 
 export const declineUpdate = (version: number) =>
   invoke<void>("decline_update", { version });
@@ -332,3 +367,8 @@ export const pickUpdateBundle = (folder: string) =>
 
 export const setUpdateHostIp = (addr: string) =>
   invoke<void>("set_update_host_ip", { addr });
+
+// Track the tray-hidden flag once for all views — while hidden, polls
+// pause so the app idles at ~0 CPU.
+listen("window-hidden", () => (appHidden.current = true));
+listen("window-shown", () => (appHidden.current = false));

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  appHidden,
   detectLaunchers,
   listSyncedPacks,
   loadIntoLauncher,
@@ -57,7 +58,9 @@ export default function LoaderView(props: Props) {
       listSyncedPacks().then(setSynced).catch(() => {});
     };
     load(true);
-    const t = window.setInterval(() => load(false), 4000);
+    const t = window.setInterval(() => {
+      if (!appHidden.current) load(false);
+    }, 4000);
     return () => window.clearInterval(t);
   }, []);
 
