@@ -236,16 +236,19 @@ export default function ConnectView(_props: Props) {
     setPubMeta(meta);
     setPubStale(stale);
     setPubOpen(true);
-    if (stale || incomplete) {
+    if (stale || incomplete || !status.metaFolder) {
       const folder = status.folder;
+      // `unconfirmed` = meta never saved for this folder (old connect.json):
+      // every value is a default, so the scan replaces — not just fills.
+      const unconfirmed = !status.metaFolder;
       suggestPackMeta(folder)
         .then((s) =>
           setPubMeta((m) => ({
-            name: m.name || s.packName || "",
+            name: unconfirmed || !m.name ? (s.packName || m.name) : m.name,
             ver: m.ver,
-            mc: m.mc || s.mcVersion || "",
-            loader: m.loader || s.loader || "",
-            lv: m.lv || s.loaderVersion || "",
+            mc: unconfirmed || !m.mc ? (s.mcVersion || m.mc) : m.mc,
+            loader: unconfirmed || !m.loader ? (s.loader || m.loader) : m.loader,
+            lv: unconfirmed || !m.lv ? (s.loaderVersion || m.lv) : m.lv,
           }))
         )
         .catch(() => {});

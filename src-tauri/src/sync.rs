@@ -456,6 +456,20 @@ fn build_file_list(folder: &Path) -> Result<Vec<ManifestFile>> {
 /// over normalized loader names and the newest most-common MC version.
 /// A shared mods folder isn't a built pack, so this is how pack meta gets
 /// filled when the host doesn't type it in.
+/// Extract a concrete MC version from a jar's declared range/exact string:
+/// "[1.21.1]" → "1.21.1", "[1.21.1,)" → "1.21.1", "(,1.22]" → "1.22",
+/// "1.21.1" → "1.21.1". Ranges take the lower bound — the vote then
+/// decides the majority MC across the whole folder.
+fn mc_from_range(v: &str) -> String {
+    let t = v.trim().trim_matches(|c| "[]()".contains(c)).to_string();
+    let mut parts = t.split(',').map(|p| p.trim().trim_matches(|c| "[]()".contains(c)));
+    let lower = parts.next().unwrap_or("");
+    if !lower.is_empty() {
+        return lower.to_string();
+    }
+    parts.next().map(|s| s.to_string()).unwrap_or_else(|| t.clone())
+}
+
 pub fn suggest_meta(mods: &[scanner::ModInfo]) -> (String, String) {
     let normalize = |l: &str| match l {
         "fabric-loader" | "fabricmc" => "fabric".to_string(),
@@ -469,8 +483,9 @@ pub fn suggest_meta(mods: &[scanner::ModInfo]) -> (String, String) {
             *loader_votes.entry(normalize(l)).or_default() += 1;
         }
         for v in &m.game_versions {
+            let v = mc_from_range(v);
             if !v.is_empty() {
-                *ver_votes.entry(v.clone()).or_default() += 1;
+                *ver_votes.entry(v).or_default() += 1;
             }
         }
     }
@@ -2933,4 +2948,19 @@ pub async fn network_info(
         .json()
         .await?;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mc_from_range;
+
+    #[test]
+    fn range_normalization() {
+        assert_eq!(mc_from_range("[1.21.1]"), "1.21.1");
+        assert_eq!(mc_from_range("[1.21.1,)"), "1.21.1");
+        assert_eq!(mc_from_range("[1.21,1.22)"), "1.21");
+        assert_eq!(mc_from_range("[1.20.6, 1.21.4]"), "1.20.6");
+        assert_eq!(mc_from_range("1.21.1"), "1.21.1");
+        assert_eq!(mc_from_range("(,1.22]"), "1.22");
+    }
 }

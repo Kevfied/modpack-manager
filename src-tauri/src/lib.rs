@@ -308,6 +308,7 @@ async fn host_publish(
     loader: String,
     loader_version: String,
 ) -> Result<String, String> {
+    crate::alog!("host", "host_publish invoked (target={target:?}, force={force})");
     let host = state.host.clone();
     let sp = sync::store_path();
     tauri::async_runtime::spawn_blocking(move || {
