@@ -295,6 +295,13 @@ async fn host_start(
     .map_err(|e| e.to_string())
 }
 
+/// Frontend → session log. Lets UI events (button clicks, dialog opens)
+/// land in the same trace as backend actions for remote diagnosis.
+#[tauri::command]
+fn ui_log(tag: String, msg: String) {
+    crate::applog::line(&tag, &msg);
+}
+
 #[tauri::command]
 async fn host_publish(
     state: tauri::State<'_, AppState>,
@@ -953,6 +960,7 @@ pub fn run() {
             host_set_folder,
             host_update,
             suggest_pack_meta,
+            ui_log,
             host_kick,
             host_forget,
             host_stop,

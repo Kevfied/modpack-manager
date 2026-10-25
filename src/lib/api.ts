@@ -260,6 +260,9 @@ export interface PublishMeta {
   loaderVersion: string;
 }
 
+export const uiLog = (tag: string, msg: string) =>
+  invoke<void>("ui_log", { tag, msg }).catch(() => {});
+
 export const hostPublish = (
   note: string,
   target: number | null,

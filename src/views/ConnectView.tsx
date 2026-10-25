@@ -24,6 +24,7 @@ import {
   scanNetworks,
   suggestPackMeta,
   tailLog,
+  uiLog,
 } from "../lib/api";
 import type {
   ApplyProgress,
@@ -222,8 +223,9 @@ export default function ConnectView(_props: Props) {
   // moved underneath it (metaFolder ≠ folder), a jar scan re-suggests in
   // the background and fills only fields that are still empty.
   const openPublish = () => {
-    if (!status?.folder) return;
-    const stale = !!status.metaFolder && status.metaFolder !== status.folder;
+    uiLog("ui", `publish click (mode=${status?.mode} folder=${status?.folder ?? "null"})`);
+    if (!status) return;
+    const stale = !!status.metaFolder && !!status.folder && status.metaFolder !== status.folder;
     const meta = {
       name: status.packName || "",
       // A folder swap invalidates the old pack's version string too.
@@ -236,7 +238,7 @@ export default function ConnectView(_props: Props) {
     setPubMeta(meta);
     setPubStale(stale);
     setPubOpen(true);
-    if (stale || incomplete || !status.metaFolder) {
+    if (status.folder && (stale || incomplete || !status.metaFolder)) {
       const folder = status.folder;
       // `unconfirmed` = meta never saved for this folder (old connect.json):
       // every value is a default, so the scan replaces — not just fills.
@@ -257,6 +259,7 @@ export default function ConnectView(_props: Props) {
 
   const confirmPublish = async () => {
     const { name, mc, loader } = pubMeta;
+    uiLog("ui", `publish confirm (name=${name} mc=${mc} loader=${loader})`);
     if (!name.trim() || !mc.trim() || !loader.trim()) {
       pushLog("x pack name, MC version and loader are required to publish");
       return;
@@ -290,6 +293,7 @@ export default function ConnectView(_props: Props) {
       const msg = String(e);
       if (msg.includes("UNCHANGED")) {
         setBusy(false);
+        uiLog("ui", "UNCHANGED — showing republish confirm");
         const ok = await confirm(
           "Nothing changed since the last publish — same files, same hashes.\n\nRepublish anyway? Members can re-apply to repair a broken copy.",
           { title: "Republish unchanged", okLabel: "Republish", cancelLabel: "Cancel" }
