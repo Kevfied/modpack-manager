@@ -321,18 +321,74 @@ async fn host_set_folder(
 }
 
 /// Rename the network and/or toggle/change the join code. Empty code = open.
+/// Empty pack-meta fields leave that field unchanged.
 #[tauri::command]
 async fn host_update(
     state: tauri::State<'_, AppState>,
     name: String,
     code: String,
+    pack_name: String,
+    mc_version: String,
+    loader: String,
+    loader_version: String,
 ) -> Result<String, String> {
     let host = state.host.clone();
     let sp = sync::store_path();
-    tauri::async_runtime::spawn_blocking(move || sync::host_update(&host, &sp, &name, &code))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        sync::host_update(
+            &host,
+            &sp,
+            &name,
+            &code,
+            &pack_name,
+            &mc_version,
+            &loader,
+            &loader_version,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// Best-guess pack meta for a mods folder: majority loader + newest common
+/// MC version from the jars' own metadata, latest loader version from
+/// Modrinth, and the folder name as the pack-name suggestion.
+#[tauri::command]
+async fn suggest_pack_meta(
+    state: tauri::State<'_, AppState>,
+    folder: String,
+) -> Result<serde_json::Value, String> {
+    let f = folder.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        scanner::scan_folder_progress(&f, |_, _| {})
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let (mc, loader) = sync::suggest_meta(&res.mods);
+    let loader = if loader.is_empty() { "fabric".to_string() } else { loader };
+    let loader_version = if mc.is_empty() {
+        String::new()
+    } else {
+        state
+            .client
+            .loader_versions(&loader, &mc)
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or_default()
+    };
+    let pack_name = std::path::Path::new(&folder)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "My Modpack".into());
+    Ok(serde_json::json!({
+        "packName": pack_name,
+        "mcVersion": mc,
+        "loader": loader,
+        "loaderVersion": loader_version,
+    }))
 }
 
 /// Kick a member — they're removed and blocked until they rejoin with the code.
@@ -865,6 +921,7 @@ pub fn run() {
             host_publish,
             host_set_folder,
             host_update,
+            suggest_pack_meta,
             host_kick,
             host_forget,
             host_stop,

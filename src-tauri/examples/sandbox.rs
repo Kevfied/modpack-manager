@@ -653,7 +653,7 @@ fn main() {
 
         // ---- 9c. edit network / code rotation ----
         println!("== edit network ==");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -700,7 +700,7 @@ fn main() {
 
         // ---- 9e. open network: no join code asked or needed ----
         println!("== open network ==");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -717,7 +717,7 @@ fn main() {
         let open_join =
             sync::join_network(&cs5, &store_path, &sync_root, &addr, "", "dave").await;
         check(open_join.is_ok(), "open network joins with empty code");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -1472,6 +1472,62 @@ fn main() {
         check(store["host"].is_null(), "host_stop cleared saved host state");
     }
 
+    // ---- 12c. pack meta: empty args auto-detect from jars + live fix ----
+    println!("== pack meta auto-detect ==");
+    {
+        let res =
+            scanner::scan_folder_progress(&host_mods2.to_string_lossy(), |_, _| {}).unwrap();
+        let (mc, loader) = sync::suggest_meta(&res.mods);
+        check(
+            mc == "1.21.1" && loader == "fabric",
+            &format!("suggest_meta reads jars (got {mc}/{loader})"),
+        );
+        sync::host_start(
+            &hs,
+            &store_path,
+            "meta-net",
+            "",
+            host_mods2.to_str().unwrap(),
+            "",
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+        {
+            let g = hs.lock().unwrap();
+            let h = g.as_ref().unwrap();
+            check(
+                h.manifest.mc_version == "1.21.1" && h.manifest.loader == "fabric",
+                "empty host meta → auto-detected into manifest",
+            );
+        }
+        // Live fix without republish: host_update edits the served manifest.
+        sync::host_update(
+            &hs,
+            &store_path,
+            "meta-net",
+            "",
+            "Fixed Pack",
+            "1.20.1",
+            "forge",
+            "47.0.0",
+        )
+        .unwrap();
+        {
+            let g = hs.lock().unwrap();
+            let h = g.as_ref().unwrap();
+            check(
+                h.manifest.pack_name == "Fixed Pack"
+                    && h.manifest.mc_version == "1.20.1"
+                    && h.manifest.loader == "forge"
+                    && h.manifest.loader_version == "47.0.0",
+                "host_update edits live manifest meta",
+            );
+        }
+        sync::host_stop(&hs, &store_path);
+    }
+
     // ---- 12b. leaving clears the synced mirror from disk ----
     println!("== leave cleans synced dir ==");
     let leftover = { cs.lock().unwrap().as_ref().unwrap().synced_dir.clone() };
@@ -2019,8 +2075,8 @@ fn main() {
     {
         let mut gone = false;
         // The Connect host stopped in §12 — its found entry ages out at
-        // FOUND_TTL. Poll until it disappears (≤30s of slack).
-        for _ in 0..60 {
+        // FOUND_TTL (45s). Poll until it disappears (75s of slack).
+        for _ in 0..150 {
             if sync::found_networks()
                 .iter()
                 .all(|f| f.name != "sandbox-net-v2")

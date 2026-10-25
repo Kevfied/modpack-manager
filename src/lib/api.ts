@@ -255,8 +255,32 @@ export const hostSetFolder = (folder: string) =>
     folder,
   });
 
-export const hostUpdate = (name: string, code: string) =>
-  invoke<string>("host_update", { name, code });
+export const hostUpdate = (
+  name: string,
+  code: string,
+  packName: string,
+  mcVersion: string,
+  loader: string,
+  loaderVersion: string
+) =>
+  invoke<string>("host_update", {
+    name,
+    code,
+    packName,
+    mcVersion,
+    loader,
+    loaderVersion,
+  });
+
+export interface PackMetaSuggest {
+  packName: string;
+  mcVersion: string;
+  loader: string;
+  loaderVersion: string;
+}
+
+export const suggestPackMeta = (folder: string) =>
+  invoke<PackMetaSuggest>("suggest_pack_meta", { folder });
 
 export const hostKick = (memberId: number) =>
   invoke<string>("host_kick", { memberId });

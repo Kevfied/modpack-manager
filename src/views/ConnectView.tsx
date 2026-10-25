@@ -22,6 +22,7 @@ import {
   loadSyncedPack,
   packExists,
   scanNetworks,
+  suggestPackMeta,
   tailLog,
 } from "../lib/api";
 import type {
@@ -50,6 +51,12 @@ export default function ConnectView(props: Props) {
   const [netCode, setNetCode] = useState("");
   const [netReqCode, setNetReqCode] = useState(true);
   const [netFolder, setNetFolder] = useState("");
+  // Pack meta for the hosted folder — prefilled from Build settings, then
+  // auto-suggested from the jars themselves when a folder is picked.
+  const [pName, setPName] = useState(() => props.settings.name || "");
+  const [pMc, setPMc] = useState(() => props.settings.mcVersion || "");
+  const [pLoader, setPLoader] = useState(() => props.settings.loader || "");
+  const [pLoaderVer, setPLoaderVer] = useState(() => props.settings.loaderVersion || "");
   const [note, setNote] = useState("");
   const [pubTarget, setPubTarget] = useState<number | "all">("all");
   // edit-network form (hosting view)
@@ -57,6 +64,7 @@ export default function ConnectView(props: Props) {
   const [editName, setEditName] = useState("");
   const [editCode, setEditCode] = useState("");
   const [editReqCode, setEditReqCode] = useState(true);
+  const [editMeta, setEditMeta] = useState({ name: "", mc: "", loader: "", lv: "" });
   // join form
   const [joinAddr, setJoinAddr] = useState("");
   const [joinCode, setJoinCode] = useState("");
@@ -176,7 +184,18 @@ export default function ConnectView(props: Props) {
 
   const pickFolder = async () => {
     const dir = await open({ directory: true, title: "Pick the mods folder to share" });
-    if (typeof dir === "string") setNetFolder(dir);
+    if (typeof dir !== "string") return;
+    setNetFolder(dir);
+    // Auto-suggest pack meta from the jars — only fills fields the user
+    // hasn't already typed into (Build-tab values still win).
+    suggestPackMeta(dir)
+      .then((s) => {
+        setPName((v) => v || s.packName);
+        setPMc((v) => v || s.mcVersion);
+        setPLoader((v) => v || s.loader);
+        setPLoaderVer((v) => v || s.loaderVersion);
+      })
+      .catch(() => {});
   };
 
   const doHost = async () => {
@@ -188,10 +207,10 @@ export default function ConnectView(props: Props) {
           netName || "My Network",
           netReqCode ? netCode : "",
           netFolder,
-          s.name || netName || "My Modpack",
-          s.mcVersion,
-          s.loader,
-          s.loaderVersion
+          pName || s.name || netName || "My Modpack",
+          pMc,
+          pLoader,
+          pLoaderVer
         )
       );
       await refresh();
@@ -284,7 +303,16 @@ export default function ConnectView(props: Props) {
   const doSaveEdit = async () => {
     setBusy(true);
     try {
-      pushLog(await hostUpdate(editName, editReqCode ? editCode : ""));
+      pushLog(
+        await hostUpdate(
+          editName,
+          editReqCode ? editCode : "",
+          editMeta.name,
+          editMeta.mc,
+          editMeta.loader,
+          editMeta.lv
+        )
+      );
       setEditing(false);
       await refresh();
     } catch (e) {
@@ -531,6 +559,35 @@ export default function ConnectView(props: Props) {
                   style={{ flex: 1 }}
                 />
               </div>
+              <label>Pack name</label>
+              <input
+                value={editMeta.name}
+                onChange={(e) => setEditMeta((m) => ({ ...m, name: e.target.value }))}
+                placeholder="keep current"
+              />
+              <label>MC version</label>
+              <input
+                value={editMeta.mc}
+                onChange={(e) => setEditMeta((m) => ({ ...m, mc: e.target.value }))}
+                placeholder="keep current"
+              />
+              <label>Loader</label>
+              <select
+                value={editMeta.loader}
+                onChange={(e) => setEditMeta((m) => ({ ...m, loader: e.target.value }))}
+              >
+                <option value="">keep current</option>
+                <option value="fabric">fabric</option>
+                <option value="forge">forge</option>
+                <option value="neoforge">neoforge</option>
+                <option value="quilt">quilt</option>
+              </select>
+              <label>Loader version</label>
+              <input
+                value={editMeta.lv}
+                onChange={(e) => setEditMeta((m) => ({ ...m, lv: e.target.value }))}
+                placeholder="keep current"
+              />
               <label></label>
               <div className="toolbar" style={{ gap: 6 }}>
                 <button className="primary" onClick={doSaveEdit} disabled={busy}>
@@ -826,10 +883,36 @@ export default function ConnectView(props: Props) {
             <button onClick={pickFolder}>Pick folder…</button>
             {netFolder && <span className="dim mono">{netFolder}</span>}
           </div>
+          <label>Pack name</label>
+          <input
+            value={pName}
+            onChange={(e) => setPName(e.target.value)}
+            placeholder={props.settings.name || "My Modpack"}
+          />
+          <label>MC version</label>
+          <input
+            value={pMc}
+            onChange={(e) => setPMc(e.target.value)}
+            placeholder="auto-detected from jars"
+          />
+          <label>Loader</label>
+          <select value={pLoader} onChange={(e) => setPLoader(e.target.value)}>
+            <option value="">auto</option>
+            <option value="fabric">fabric</option>
+            <option value="forge">forge</option>
+            <option value="neoforge">neoforge</option>
+            <option value="quilt">quilt</option>
+          </select>
+          <label>Loader version</label>
+          <input
+            value={pLoaderVer}
+            onChange={(e) => setPLoaderVer(e.target.value)}
+            placeholder="latest"
+          />
         </div>
         <div className="dim" style={{ margin: "8px 0" }}>
-          Pack targets MC {props.settings.mcVersion || "?"} · {props.settings.loader}
-          {props.settings.loaderVersion ? ` ${props.settings.loaderVersion}` : ""} — set in Build tab.
+          Blank fields auto-detect from the jars — members need MC + loader to
+          install the pack into a launcher.
         </div>
         <button className="primary" onClick={doHost} disabled={busy || !netFolder}>
           Start hosting

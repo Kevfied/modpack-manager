@@ -20,12 +20,12 @@ pub const BROADCAST_PORT: u16 = 47677;
 const CODE_HEADER: &str = "X-Join-Code";
 const MEMBER_HEADER: &str = "X-Member-Id";
 const HEARTBEAT_SECS: u64 = 15;
-const ONLINE_WINDOW_SECS: u64 = 45;
+const ONLINE_WINDOW_SECS: u64 = 135;
 /// Missed host contacts before `host_online` flips off — one dropped
 /// heartbeat on a congested link must not flap the badge.
 const OFFLINE_MISSES: u32 = 3;
 /// How long a found network stays listed after its announces stop.
-const FOUND_TTL_SECS: u64 = 15;
+const FOUND_TTL_SECS: u64 = 45;
 /// Per-file GET ceiling — generous because per-chunk stall timeouts and
 /// retry/resume handle real stalls; this only bounds a dead connection.
 const FILE_TIMEOUT_SECS: u64 = 3600;
@@ -398,8 +398,10 @@ fn clear_saved_client(store_path: &Path) {
 // ------------------------------------------------------- manifest
 
 /// Hash all jars under `folder` into a manifest file list (relative paths).
-fn build_file_list(folder: &Path) -> Result<Vec<ManifestFile>> {
-    let res = scanner::scan_folder_progress(&folder.to_string_lossy(), |_, _| {})?;
+fn manifest_files_from_scan(
+    res: &scanner::ScanResult,
+    folder: &Path,
+) -> Result<Vec<ManifestFile>> {
     let mut files: Vec<ManifestFile> = Vec::with_capacity(res.mods.len());
     for m in &res.mods {
         let Ok(rel) = Path::new(&m.path).strip_prefix(folder) else { continue };
@@ -415,6 +417,47 @@ fn build_file_list(folder: &Path) -> Result<Vec<ManifestFile>> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+fn build_file_list(folder: &Path) -> Result<Vec<ManifestFile>> {
+    let res = scanner::scan_folder_progress(&folder.to_string_lossy(), |_, _| {})?;
+    manifest_files_from_scan(&res, folder)
+}
+
+/// Guess (mc_version, loader) from the jars' own metadata — majority vote
+/// over normalized loader names and the newest most-common MC version.
+/// A shared mods folder isn't a built pack, so this is how pack meta gets
+/// filled when the host doesn't type it in.
+pub fn suggest_meta(mods: &[scanner::ModInfo]) -> (String, String) {
+    let normalize = |l: &str| match l {
+        "fabric-loader" | "fabricmc" => "fabric".to_string(),
+        "quilt-loader" => "quilt".to_string(),
+        other => other.to_string(),
+    };
+    let mut loader_votes: HashMap<String, usize> = HashMap::new();
+    let mut ver_votes: HashMap<String, usize> = HashMap::new();
+    for m in mods {
+        for l in &m.loaders {
+            *loader_votes.entry(normalize(l)).or_default() += 1;
+        }
+        for v in &m.game_versions {
+            if !v.is_empty() {
+                *ver_votes.entry(v.clone()).or_default() += 1;
+            }
+        }
+    }
+    let loader = loader_votes
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(l, _)| l)
+        .unwrap_or_default();
+    let mc = ver_votes
+        .into_iter()
+        // most jars agreeing wins; ties go to the higher version string
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+        .map(|(v, _)| v)
+        .unwrap_or_default();
+    (mc, loader)
 }
 
 fn sha1_file(path: &Path) -> Result<String> {
@@ -478,8 +521,19 @@ pub fn host_start(
     if !folder_path.is_dir() {
         anyhow::bail!("not a directory: {folder}");
     }
-    let n_files = build_file_list(&folder_path)?.len(); // staged count only
+    // One scan covers both jobs: the staged file list AND meta auto-fill —
+    // jars declare their loader + game version, so a plain mods folder
+    // doesn't need Build-tab settings to be installable downstream.
+    let res = scanner::scan_folder_progress(folder, |_, _| {})?;
+    let n_files = manifest_files_from_scan(&res, &folder_path)?.len();
     let network_id = new_id();
+    let (sug_mc, sug_loader) = suggest_meta(&res.mods);
+    let mc_version = if mc_version.trim().is_empty() { sug_mc } else { mc_version.into() };
+    let loader = if loader.trim().is_empty() {
+        if sug_loader.is_empty() { "fabric".into() } else { sug_loader }
+    } else {
+        loader.into()
+    };
     // STRICT: nothing is published until the Publish button is pressed.
     // The manifest starts at v0 / empty — clients see "nothing published".
     let manifest = Manifest {
@@ -487,8 +541,8 @@ pub fn host_start(
         pack_name: pack_name.to_string(),
         version: 0,
         note: String::new(),
-        mc_version: mc_version.into(),
-        loader: loader.into(),
+        mc_version: mc_version.clone(),
+        loader: loader.clone(),
         loader_version: loader_version.into(),
         files: vec![],
     };
@@ -499,8 +553,8 @@ pub fn host_start(
         code: code.to_string(),
         folder: folder_path,
         pack_name: pack_name.into(),
-        mc_version: mc_version.into(),
-        loader: loader.into(),
+        mc_version,
+        loader,
         loader_version: loader_version.into(),
         history: vec![],
         manifest,
@@ -593,21 +647,54 @@ fn host_resume(hs: &SharedHost, store_path: &Path, saved: &SavedHost) -> Result<
 /// Host-only: rename the network and/or toggle/change the join code.
 /// Empty `code` = open network. Existing members are unaffected — they
 /// authenticate by member id, so a code change only gates new joins.
+#[allow(clippy::too_many_arguments)]
 pub fn host_update(
     hs: &SharedHost,
     store_path: &Path,
     name: &str,
     code: &str,
+    pack_name: &str,
+    mc_version: &str,
+    loader: &str,
+    loader_version: &str,
 ) -> Result<String> {
     let mut g = hs.lock().unwrap();
     let h = g.as_mut().context("not hosting")?;
     h.name = if name.trim().is_empty() { "My Network".into() } else { name.trim().into() };
     h.code = code.to_string();
+    // Pack meta: empty means "leave unchanged". Updating the live manifest
+    // (and any targeted manifests) makes the fix visible to members on
+    // their next check — no republish needed just to correct metadata.
+    if !pack_name.trim().is_empty() {
+        h.pack_name = pack_name.trim().into();
+    }
+    if !mc_version.trim().is_empty() {
+        h.mc_version = mc_version.trim().into();
+    }
+    if !loader.trim().is_empty() {
+        h.loader = loader.trim().into();
+    }
+    if !loader_version.trim().is_empty() {
+        h.loader_version = loader_version.trim().into();
+    }
+    h.manifest.pack_name = h.pack_name.clone();
+    h.manifest.mc_version = h.mc_version.clone();
+    h.manifest.loader = h.loader.clone();
+    h.manifest.loader_version = h.loader_version.clone();
+    for m in h.targets.values_mut() {
+        m.pack_name = h.pack_name.clone();
+        m.mc_version = h.mc_version.clone();
+        m.loader = h.loader.clone();
+        m.loader_version = h.loader_version.clone();
+    }
     crate::alog!(
         "host",
-        "network updated — \"{}\"{}",
+        "network updated — \"{}\"{} (pack \"{}\" {} {})",
         h.name,
-        if h.code.is_empty() { " (open)" } else { " (join code set)" }
+        if h.code.is_empty() { " (open)" } else { " (join code set)" },
+        h.pack_name,
+        h.mc_version,
+        h.loader,
     );
     save_host(store_path, h);
     Ok(format!(
@@ -2439,7 +2526,7 @@ pub async fn load_synced_pack(
     let dir = root.join("_synced").join(network_id);
     let meta = std::fs::read_to_string(dir.join("pack.json")).context("pack.json missing — apply the update first")?;
     let v: serde_json::Value = serde_json::from_str(&meta)?;
-    let cfg = pack::PackConfig {
+    let mut cfg = pack::PackConfig {
         name: v["name"].as_str().unwrap_or("Synced Pack").to_string(),
         version: format!("v{}", v["version"].as_u64().unwrap_or(0)),
         summary: String::new(),
@@ -2450,6 +2537,18 @@ pub async fn load_synced_pack(
     };
     if cfg.mc_version.is_empty() {
         anyhow::bail!("this synced pack has no MC version — host needs to set one in Build");
+    }
+    // Hosts may publish without a loader version — resolve latest so every
+    // install path (esp. Prism's mmc-pack.json) gets a concrete one.
+    if cfg.loader_version.is_empty() {
+        if let Some(lv) = client
+            .loader_versions(&cfg.loader, &cfg.mc_version)
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+        {
+            cfg.loader_version = lv;
+        }
     }
     let mods_dir = dir.join("mods");
     let mut log = String::new();

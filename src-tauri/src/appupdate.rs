@@ -27,7 +27,7 @@ const APP_ID: &str = "com.modpackmanager.app";
 const CHANNEL: &str = "stable";
 const MANIFEST_CAP: usize = 64 * 1024;
 const ANNOUNCE_SECS: u64 = 3;
-const SEEDER_TTL_SECS: u64 = 12;
+const SEEDER_TTL_SECS: u64 = 45;
 const MAX_SEEDERS: usize = 3;
 
 // ---------------------------------------------------------------- types
