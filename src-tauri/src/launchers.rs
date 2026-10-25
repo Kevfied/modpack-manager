@@ -46,13 +46,40 @@ pub fn detect() -> DetectedLoaders {
             path: None,
             data_dir: Some(mc.to_string_lossy().to_string()),
         });
-        if mc.join("TlauncherProfiles.json").is_file() {
+    }
+
+    // TLauncher: game dir comes from .tlauncher/tlauncher-2.0.properties
+    // (minecraft.gamedir), defaulting to .minecraft. Its profiles/accounts
+    // file TlauncherProfiles.json lives inside the game dir.
+    let tl_props = dirs::data_dir().map(|d| d.join(".tlauncher").join("tlauncher-2.0.properties"));
+    let tl_installed = tl_props.as_ref().is_some_and(|p| p.is_file());
+    let tl_gamedir = tl_props
+        .as_ref()
+        .filter(|p| p.is_file())
+        .and_then(|p| read_prop(&p, "minecraft.gamedir"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(minecraft_dir);
+    if let Some(dir) = tl_gamedir {
+        if tl_installed || dir.join("TlauncherProfiles.json").is_file() {
             launchers.push(LauncherInfo {
                 kind: "tlauncher".into(),
                 name: "TLauncher".into(),
                 path: None,
-                data_dir: Some(mc.to_string_lossy().to_string()),
+                data_dir: Some(dir.to_string_lossy().to_string()),
             });
+        }
+        // Custom game dir? Its versions matter too — merge into the picker list.
+        if minecraft_dir().map(|mc| mc != dir).unwrap_or(true) {
+            if let Ok(rd) = std::fs::read_dir(dir.join("versions")) {
+                installed_versions.extend(
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.file_name().to_string_lossy().to_string()),
+                );
+                installed_versions.sort();
+                installed_versions.dedup();
+            }
         }
     }
 
@@ -88,9 +115,157 @@ pub(crate) fn instances_root() -> Result<PathBuf> {
     Ok(base)
 }
 
+/// Read a key from a Java .properties file (unescapes `\\`, `\:`, `\=`).
+fn read_prop(path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix(&prefix) {
+            // Java properties escapes: \\ -> \, \: -> :, \= -> =
+            let mut out = String::with_capacity(v.len());
+            let mut chars = v.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some(n) => out.push(n),
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// TLauncher's game dir: minecraft.gamedir from tlauncher-2.0.properties,
+/// falling back to the standard .minecraft.
+pub fn tlauncher_gamedir() -> Option<PathBuf> {
+    dirs::data_dir()
+        .map(|d| d.join(".tlauncher").join("tlauncher-2.0.properties"))
+        .filter(|p| p.is_file())
+        .and_then(|p| read_prop(&p, "minecraft.gamedir"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(minecraft_dir)
+}
+
+/// Folder/id name for a TLauncher modpack version. Real TLauncher packs keep
+/// their display name verbatim (spaces, caps) — only strip path-illegal chars.
+fn tlauncher_dirname(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '-' } else { c })
+        .collect();
+    let clean = clean.trim().trim_end_matches('.').trim();
+    if clean.is_empty() { "Modpack".into() } else { clean.into() }
+}
+
+/// Write versions/<name>/<name>.json + TLauncherAdditional.json so the pack
+/// appears in TLauncher's version list as a self-contained modpack whose game
+/// dir is the version folder itself. Returns the version dir (= game dir).
+pub(crate) async fn tlauncher_stage_version(
+    client: &ModrinthClient,
+    mc: &Path,
+    config: &PackConfig,
+    log: &mut String,
+) -> Result<PathBuf> {
+    let dirname = tlauncher_dirname(&config.name);
+    let version_dir = mc.join("versions").join(&dirname);
+
+    // Loader profile: fetch fabric/quilt directly; reuse an installed
+    // forge/neoforge version's json (can't run their installers here).
+    let mut profile = match config.loader.as_str() {
+        "fabric" | "quilt" => {
+            let lv = if config.loader_version.is_empty() {
+                client
+                    .loader_versions(&config.loader, &config.mc_version)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .context("no loader versions found")?
+            } else {
+                config.loader_version.clone()
+            };
+            if config.loader == "fabric" {
+                client.fabric_profile(&config.mc_version, &lv).await?
+            } else {
+                client.quilt_profile(&config.mc_version, &lv).await?
+            }
+        }
+        _ => {
+            let vid = ensure_loader_version(client, mc, config, log).await?;
+            let src = mc.join("versions").join(&vid).join(format!("{vid}.json"));
+            serde_json::from_str(&std::fs::read_to_string(&src)?)
+                .context("parse loader version json")?
+        }
+    };
+    // Rename to the pack name and add the fields TLauncher appends.
+    profile["id"] = serde_json::json!(dirname);
+    if profile.get("jar").is_none() && !config.mc_version.is_empty() {
+        profile["jar"] = serde_json::json!(config.mc_version);
+    }
+    profile["source"] = serde_json::json!("local_version_repo");
+    if profile.get("skinVersion").is_none() {
+        profile["skinVersion"] = serde_json::json!(false);
+    }
+
+    std::fs::create_dir_all(&version_dir)?;
+    std::fs::write(
+        version_dir.join(format!("{dirname}.json")),
+        serde_json::to_string_pretty(&profile)?,
+    )?;
+
+    // TLauncher creates this on first launch — pre-create so the TL badge
+    // and skin system work immediately. Leave an existing one alone (it may
+    // hold modpack registry data).
+    let additional = version_dir.join("TLauncherAdditional.json");
+    if !additional.is_file() {
+        std::fs::write(
+            &additional,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "activateSkinCapeForUserVersion": true,
+                "skipHashsumValidation": false,
+            }))?,
+        )?;
+    }
+    log.push_str(&format!("✓ wrote TLauncher version \"{dirname}\"\n"));
+    Ok(version_dir)
+}
+
+/// Deploy to TLauncher: a self-contained modpack folder in versions/<name>/
+/// (json + mods + TLauncherAdditional.json). The folder IS the game dir.
+pub async fn deploy_tlauncher(
+    client: &ModrinthClient,
+    mods: &[ModInfo],
+    config: &PackConfig,
+    data_dir: Option<&str>,
+) -> Result<String> {
+    let mc = data_dir
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(tlauncher_gamedir)
+        .context("TLauncher game dir not found")?;
+    let mut log = String::new();
+    let gamedir = tlauncher_stage_version(client, &mc, config, &mut log).await?;
+    let n = pack::stage_instance(&gamedir, mods, config)?;
+    log.push_str(&format!(
+        "✓ staged {} mod(s) into {}\n",
+        n,
+        gamedir.to_string_lossy()
+    ));
+    log.push_str(&format!(
+        "✓ done — open TLauncher, pick \"{}\" in the version list, press Play",
+        config.name
+    ));
+    Ok(log)
+}
+
 /// Deploy to .minecraft: stage instance dir, ensure loader version json,
-/// add a launcher_profiles.json entry. Works for the official launcher and
-/// anything else that reads .minecraft/versions (TLauncher included).
+/// add a launcher_profiles.json entry. Official launcher only — TLauncher
+/// gets its own self-contained path (deploy_tlauncher).
 pub async fn deploy_vanilla(
     client: &ModrinthClient,
     mods: &[ModInfo],
@@ -296,6 +471,7 @@ async fn install_mrpack_files(
     path: &str,
     parent: &Path,
     gamedir_name: Option<&str>,
+    pretty_name: bool,
     log: &mut String,
 ) -> Result<(MrpackDeps, PathBuf)> {
     use std::io::Read;
@@ -307,9 +483,13 @@ async fn install_mrpack_files(
         .read_to_string(&mut index_text)?;
     let index: serde_json::Value = serde_json::from_str(&index_text)?;
 
-    let instance = parent.join(pack::slugify(
-        index["name"].as_str().unwrap_or("Imported Pack"),
-    ));
+    let pack_name = index["name"].as_str().unwrap_or("Imported Pack");
+    let folder = if pretty_name {
+        tlauncher_dirname(pack_name)
+    } else {
+        pack::slugify(pack_name)
+    };
+    let instance = parent.join(folder);
     let gamedir = match gamedir_name {
         Some(sub) => instance.join(sub),
         None => instance.clone(),
@@ -399,7 +579,7 @@ pub async fn install_mrpack_vanilla(
     root: &Path,
 ) -> Result<String> {
     let mut log = String::new();
-    let (deps, instance) = install_mrpack_files(path, root, None, &mut log).await?;
+    let (deps, instance) = install_mrpack_files(path, root, None, false, &mut log).await?;
     let cfg = PackConfig {
         name: deps.name.clone(),
         version: deps.version,
@@ -419,13 +599,93 @@ pub async fn install_mrpack_vanilla(
     Ok(log)
 }
 
+/// Install a .mrpack as a TLauncher modpack: files land directly in
+/// versions/<pack name>/ (the version folder IS the game dir), plus the
+/// pack-named version json and TLauncherAdditional.json.
+pub async fn install_mrpack_tlauncher(
+    client: &ModrinthClient,
+    path: &str,
+    mc: &Path,
+) -> Result<String> {
+    let mut log = String::new();
+    let versions = mc.join("versions");
+    let (deps, instance) = install_mrpack_files(path, &versions, None, true, &mut log).await?;
+    let cfg = PackConfig {
+        name: deps.name.clone(),
+        version: deps.version,
+        summary: String::new(),
+        mc_version: deps.mc_version.clone(),
+        loader: deps.loader.clone(),
+        loader_version: deps.loader_version.clone(),
+        selected_paths: vec![],
+    };
+    let staged = tlauncher_stage_version(client, mc, &cfg, &mut log).await?;
+    debug_assert_eq!(staged, instance); // same name -> same version dir
+    log.push_str(&format!(
+        "✓ modpack \"{}\" ready — open TLauncher, pick it, press Play",
+        deps.name
+    ));
+    Ok(log)
+}
+
+/// Install a plain .zip into TLauncher as a self-contained versions/<name>/ pack.
+pub async fn install_zip_tlauncher(
+    client: &ModrinthClient,
+    path: &str,
+    mc: &Path,
+    config: &PackConfig,
+) -> Result<String> {
+    let file = std::fs::File::open(path).context("open zip")?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    if config.mc_version.is_empty() {
+        anyhow::bail!("set an MC version (Build tab) before loading a .zip into TLauncher");
+    }
+    let dirname = tlauncher_dirname(&config.name);
+    let gamedir = mc.join("versions").join(&dirname);
+    let mods_dir = gamedir.join("mods");
+    std::fs::create_dir_all(&mods_dir)?;
+
+    let entries: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+    let mut count = 0usize;
+    for entry in &entries {
+        if entry.ends_with('/') {
+            continue;
+        }
+        let is_jar = entry.to_lowercase().ends_with(".jar");
+        let in_mods = entry.starts_with("mods/") || !entry.contains('/');
+        if is_jar && in_mods {
+            let dest = mods_dir.join(pack::safe_filename(entry));
+            let mut src = zip.by_name(entry)?;
+            let mut dst = std::fs::File::create(&dest)?;
+            std::io::copy(&mut src, &mut dst)?;
+            count += 1;
+        } else if entry.starts_with("config/") {
+            let rel = entry.trim_start_matches("config/");
+            if let Some(dest) = safe_dest(&gamedir.join("config"), rel) {
+                if let Some(p) = dest.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                let mut src = zip.by_name(entry)?;
+                let mut dst = std::fs::File::create(&dest)?;
+                std::io::copy(&mut src, &mut dst)?;
+            }
+        }
+    }
+    let mut log = format!("✓ extracted {count} mod(s)\n");
+    tlauncher_stage_version(client, mc, config, &mut log).await?;
+    log.push_str(&format!(
+        "✓ modpack \"{dirname}\" ready — open TLauncher, pick it, press Play"
+    ));
+    Ok(log)
+}
+
 /// Install a .mrpack as a real Prism instance (downloads + overrides into
 /// instances/<id>/.minecraft, mmc-pack.json with the pack's loader deps).
 pub async fn install_mrpack_prism(path: &str, data_dir: &str) -> Result<String> {
     let mut log = String::new();
     let inst_root = Path::new(data_dir).join("instances");
     let (deps, instance) =
-        install_mrpack_files(path, &inst_root, Some(".minecraft"), &mut log).await?;
+        install_mrpack_files(path, &inst_root, Some(".minecraft"), false, &mut log).await?;
     let id = instance
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -587,6 +847,19 @@ pub fn pack_instance_exists(launcher: &LauncherInfo, name: &str) -> bool {
             .as_deref()
             .map(|dd| Path::new(dd).join("instances").join(&slug).is_dir())
             .unwrap_or(false),
+        "tlauncher" => {
+            let dir = launcher
+                .data_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(tlauncher_gamedir);
+            dir.map(|mc| {
+                let dn = tlauncher_dirname(name);
+                mc.join("versions").join(&dn).join(format!("{dn}.json")).is_file()
+            })
+            .unwrap_or(false)
+        }
         _ => {
             let inst_exists = instances_root()
                 .map(|r| r.join(&slug).is_dir())
@@ -676,6 +949,14 @@ pub async fn load_pack_file(
                 .context("prism data dir not found")?;
             install_zip_prism(path, dd, config)
         }
+        ("tlauncher", "mrpack") => {
+            let mc = tlauncher_mc(&launcher)?;
+            install_mrpack_tlauncher(client, path, &mc).await
+        }
+        ("tlauncher", "zip") => {
+            let mc = tlauncher_mc(&launcher)?;
+            install_zip_tlauncher(client, path, &mc, config).await
+        }
         (_, "mrpack") => {
             let mc = minecraft_dir().context(".minecraft not found")?;
             install_mrpack_vanilla(client, path, &mc, &instances_root()?).await
@@ -686,6 +967,16 @@ pub async fn load_pack_file(
         }
         (_, other) => anyhow::bail!("unsupported file type: .{other}"),
     }
+}
+
+fn tlauncher_mc(launcher: &LauncherInfo) -> Result<PathBuf> {
+    launcher
+        .data_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(tlauncher_gamedir)
+        .context("TLauncher game dir not found")
 }
 
 /// Open an existing .mrpack with Prism's importer, or the OS association.
@@ -796,4 +1087,133 @@ pub async fn deploy_prism(
         log.push_str("✓ opened the .mrpack — import it in your launcher");
     }
     Ok(log)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mm-tl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cfg(loader: &str) -> PackConfig {
+        PackConfig {
+            name: "My Modpack".into(),
+            version: "1.0.0".into(),
+            summary: String::new(),
+            mc_version: "1.20.1".into(),
+            loader: loader.into(),
+            loader_version: "47.2.0".into(),
+            selected_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn dirname_keeps_pretty_name_sanitizes_illegal() {
+        assert_eq!(tlauncher_dirname("My Modpack"), "My Modpack");
+        assert_eq!(tlauncher_dirname("Star Technology 1.20.1-THETA"), "Star Technology 1.20.1-THETA");
+        assert_eq!(tlauncher_dirname(r"a/b\c:d"), "a-b-c-d");
+        assert_eq!(tlauncher_dirname("   "), "Modpack");
+        assert_eq!(tlauncher_dirname("name..."), "name");
+    }
+
+    #[test]
+    fn read_prop_unescapes_java_properties() {
+        let d = tmpdir("prop");
+        let f = d.join("tlauncher-2.0.properties");
+        std::fs::write(&f, "minecraft.gamedir=C\\:\\\\Users\\\\ACER\\\\mc\nother=1\n").unwrap();
+        assert_eq!(
+            read_prop(&f, "minecraft.gamedir").unwrap(),
+            "C:\\Users\\ACER\\mc"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn stage_version_writes_self_contained_pack() {
+        let d = tmpdir("stage");
+        let mc = d.join(".minecraft");
+        // Fake an installed forge version for ensure_loader_version to reuse.
+        let fv = mc.join("versions").join("1.20.1-forge-47.2.0");
+        std::fs::create_dir_all(&fv).unwrap();
+        std::fs::write(
+            fv.join("1.20.1-forge-47.2.0.json"),
+            r#"{"id":"1.20.1-forge-47.2.0","mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher","type":"release"}"#,
+        )
+        .unwrap();
+
+        let client = crate::modrinth::ModrinthClient::new();
+        let mut log = String::new();
+        let gamedir = tlauncher_stage_version(&client, &mc, &cfg("forge"), &mut log)
+            .await
+            .unwrap();
+
+        // versions/My Modpack/ IS the game dir
+        assert_eq!(gamedir, mc.join("versions").join("My Modpack"));
+        let json_path = gamedir.join("My Modpack.json");
+        assert!(json_path.is_file(), "pack version json exists");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(doc["id"], "My Modpack");
+        assert_eq!(doc["jar"], "1.20.1");
+        assert_eq!(doc["source"], "local_version_repo");
+        assert_eq!(doc["mainClass"], "cpw.mods.bootstraplauncher.BootstrapLauncher");
+        assert!(gamedir.join("TLauncherAdditional.json").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn deploy_stages_mods_inside_version_dir() {
+        let d = tmpdir("deploy");
+        let mc = d.join(".minecraft");
+        let fv = mc.join("versions").join("1.20.1-forge-47.2.0");
+        std::fs::create_dir_all(&fv).unwrap();
+        std::fs::write(
+            fv.join("1.20.1-forge-47.2.0.json"),
+            r#"{"id":"1.20.1-forge-47.2.0","mainClass":"x","type":"release"}"#,
+        )
+        .unwrap();
+
+        // A mod jar to stage.
+        let jar = d.join("coolmod.jar");
+        std::fs::write(&jar, b"fake jar bytes").unwrap();
+        let mods = vec![ModInfo {
+            path: jar.to_string_lossy().into(),
+            filename: "coolmod.jar".into(),
+            size: 14,
+            sha1: String::new(),
+            sha512: String::new(),
+            mod_id: None,
+            name: None,
+            version: None,
+            loaders: vec![],
+            environment: None,
+            game_versions: vec![],
+            parse_error: None,
+        }];
+
+        let client = crate::modrinth::ModrinthClient::new();
+        let mut config = cfg("forge");
+        config.selected_paths = vec![jar.to_string_lossy().into_owned()];
+        let out = deploy_tlauncher(
+            &client,
+            &mods,
+            &config,
+            Some(mc.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let gamedir = mc.join("versions").join("My Modpack");
+        assert!(gamedir.join("mods").join("coolmod.jar").is_file(),
+            "mod jar lands INSIDE the version folder (it is the game dir)");
+        assert!(gamedir.join("My Modpack.json").is_file());
+        assert!(out.contains("press Play"), "{out}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

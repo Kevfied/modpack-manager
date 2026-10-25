@@ -126,6 +126,7 @@ fn spawn_fake_host(files: &[(String, Vec<u8>)]) -> FakeHost {
     let manifest = sync::Manifest {
         network_id: "fake-net".into(),
         pack_name: "Fake Pack".into(),
+        pack_version: "1.0".into(),
         version: 1,
         note: String::new(),
         mc_version: "1.21.1".into(),
@@ -316,7 +317,7 @@ fn main() {
             .unwrap();
         check(info["name"] == "sandbox-net", "server binds + /info answers");
         check(info["latestVersion"] == 0, "STRICT: nothing published until button pressed");
-        sync::host_publish(&hs, &store_path, "first", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "first", None, false, false, "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -365,7 +366,7 @@ fn main() {
         make_jar(&host_mods.join("alpha.jar"), "alpha", "2.0-changed");
         make_jar(&host_mods.join("delta.jar"), "delta", "1.0");
         std::fs::remove_file(host_mods.join("gamma.jar")).unwrap();
-        sync::host_publish(&hs, &store_path, "delta test", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "delta test", None, false, false, "", "", "", "", "").unwrap();
         let (m2, dl, del) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
         check(m2.version == 2, "v2 pending");
         check(dl == 2, &format!("2 files to download (got {dl})"));
@@ -376,11 +377,14 @@ fn main() {
 
         // ---- 6. decline ----
         println!("== decline ==");
-        sync::host_publish(&hs, &store_path, "", None, false).unwrap(); // no changes → guard
-        let g = sync::host_publish(&hs, &store_path, "", None, false).unwrap();
-        check(g.contains("nothing changed"), "no-change publish guarded");
+        let r = sync::host_publish(&hs, &store_path, "", None, false, false, "", "", "", "", ""); // no changes → UNCHANGED
+        check(
+            r.as_ref().err().map(|e| e.to_string().contains("UNCHANGED")).unwrap_or(false),
+            "no-change publish returns UNCHANGED sentinel",
+        );
+        // (force=true republish exercised later in the meta block)
         make_jar(&host_mods.join("beta.jar"), "beta", "2.0-changed");
-        sync::host_publish(&hs, &store_path, "v3 skip me", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "v3 skip me", None, false, false, "", "", "", "", "").unwrap();
         sync::decline_update(&cs, &store_path, 3).unwrap();
         check(
             sync::check_pending(&cs, &http).await.unwrap().is_none(),
@@ -394,7 +398,7 @@ fn main() {
             "declined versions persisted to disk",
         );
         make_jar(&host_mods.join("eps.jar"), "eps", "1.0");
-        sync::host_publish(&hs, &store_path, "v4", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "v4", None, false, false, "", "", "", "", "").unwrap();
         check(
             sync::check_pending(&cs, &http).await.unwrap().is_some(),
             "newer v4 still shows after declining v3",
@@ -408,14 +412,14 @@ fn main() {
         println!("== targeted re-push after decline ==");
         let alice_mid0 = cs.lock().unwrap().as_ref().unwrap().member_id;
         make_jar(&host_mods.join("decoy.jar"), "decoy", "1.0");
-        sync::host_publish(&hs, &store_path, "v5 decoy", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "v5 decoy", None, false, false, "", "", "", "", "").unwrap();
         sync::decline_update(&cs, &store_path, 5).unwrap();
         check(
             sync::check_pending(&cs, &http).await.unwrap().is_none(),
             "declined v5 hidden",
         );
         // Same files, but targeted at alice → must publish (not "nothing changed")
-        let t2 = sync::host_publish(&hs, &store_path, "try again alice", Some(alice_mid0), false)
+        let t2 = sync::host_publish(&hs, &store_path, "try again alice", Some(alice_mid0), false, false, "", "", "", "", "")
             .unwrap();
         check(t2.contains("v6"), &format!("targeted re-push allowed ({t2})"));
         check(
@@ -440,7 +444,7 @@ fn main() {
             sync::host_set_folder(&hs, &store_path, host_mods2.to_str().unwrap()).unwrap();
         check(count == 2, &format!("new folder has {count} files"));
         check(same_pct < 60, &format!("low overlap flagged ({same_pct}%)"));
-        sync::host_publish(&hs, &store_path, "folder swap", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "folder swap", None, false, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         check(
             !nid.join("mods/beta.jar").exists() && nid.join("mods/newpack.jar").is_file(),
@@ -451,7 +455,7 @@ fn main() {
         println!("== targeted publish ==");
         let alice_mid = cs.lock().unwrap().as_ref().unwrap().member_id;
         make_jar(&host_mods2.join("secret.jar"), "secret", "1.0");
-        let t = sync::host_publish(&hs, &store_path, "only alice", Some(alice_mid), false).unwrap();
+        let t = sync::host_publish(&hs, &store_path, "only alice", Some(alice_mid), false, false, "", "", "", "", "").unwrap();
         println!("{t}");
         check(t.contains("only"), "publish reports targeted");
         // bob (member 42) sees only the global manifest, not alice's target
@@ -514,7 +518,7 @@ fn main() {
         // ---- 6d. special characters + path traversal ----
         println!("== filename edge cases ==");
         make_jar(&host_mods2.join("mød+1.jar"), "modplus", "1.0");
-        sync::host_publish(&hs, &store_path, "utf8 name", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "utf8 name", None, false, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         check(
             nid.join("mods/mød+1.jar").is_file(),
@@ -540,12 +544,12 @@ fn main() {
         let empty_dir = base.join("empty-mods");
         std::fs::create_dir_all(&empty_dir).unwrap();
         sync::host_set_folder(&hs, &store_path, empty_dir.to_str().unwrap()).unwrap();
-        let r = sync::host_publish(&hs, &store_path, "empty", None, false);
+        let r = sync::host_publish(&hs, &store_path, "empty", None, false, false, "", "", "", "", "");
         check(
             r.is_err() && r.unwrap_err().to_string().contains("EMPTY_PACK"),
             "empty folder publish blocked",
         );
-        sync::host_publish(&hs, &store_path, "empty ok", None, true).unwrap();
+        sync::host_publish(&hs, &store_path, "empty ok", None, true, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         let left = std::fs::read_dir(nid.join("mods"))
             .unwrap()
@@ -555,7 +559,7 @@ fn main() {
         check(left == 0, "empty publish wiped member mods (mirror)");
         // restore real folder so later sections have content
         sync::host_set_folder(&hs, &store_path, host_mods2.to_str().unwrap()).unwrap();
-        sync::host_publish(&hs, &store_path, "restore", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "restore", None, false, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         check(nid.join("mods/alpha.jar").is_file(), "folder restored, files back");
     });
@@ -564,7 +568,7 @@ fn main() {
     rt.block_on(async {
         println!("== tamper detection ==");
         make_jar(&host_mods2.join("zeta.jar"), "zeta", "1.0");
-        sync::host_publish(&hs, &store_path, "v7", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "v7", None, false, false, "", "", "", "", "").unwrap();
         let nid = cs.lock().unwrap().as_ref().unwrap().synced_dir.clone();
         std::fs::write(nid.join("mods/alpha.jar"), b"tampered").unwrap();
         let (_, dl, _) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
@@ -579,7 +583,7 @@ fn main() {
         println!("== .part cleanup ==");
         std::fs::write(nid.join("mods/stale.part"), b"x").unwrap();
         make_jar(&host_mods2.join("eta.jar"), "eta", "1.0");
-        sync::host_publish(&hs, &store_path, "v8", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "v8", None, false, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         check(!nid.join("mods/stale.part").exists(), "stale .part cleaned");
 
@@ -653,7 +657,7 @@ fn main() {
 
         // ---- 9c. edit network / code rotation ----
         println!("== edit network ==");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -700,7 +704,7 @@ fn main() {
 
         // ---- 9e. open network: no join code asked or needed ----
         println!("== open network ==");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "", "", "", "", "").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "", "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -717,7 +721,7 @@ fn main() {
         let open_join =
             sync::join_network(&cs5, &store_path, &sync_root, &addr, "", "dave").await;
         check(open_join.is_ok(), "open network joins with empty code");
-        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "").unwrap();
+        sync::host_update(&hs, &store_path, "sandbox-net-v2", "newcode", "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
             .send()
@@ -839,7 +843,7 @@ fn main() {
             .await
             .unwrap();
         check(r.status().is_success(), "eve2 joins as 8888");
-        let tgt = sync::host_publish(&hs, &store_path, "secret", Some(8888), false).unwrap();
+        let tgt = sync::host_publish(&hs, &store_path, "secret", Some(8888), false, false, "", "", "", "", "").unwrap();
         check(tgt.contains("only"), "targeted publish to 8888");
         let tm: serde_json::Value = http
             .get(format!("http://{addr}/manifest"))
@@ -1190,7 +1194,7 @@ fn main() {
         // from whatever h.folder currently points at.
         let cur_folder = hs.lock().unwrap().as_ref().unwrap().folder.clone();
         make_jar(&cur_folder.join("epsilon.jar"), "epsilon", "1.0");
-        sync::host_publish(&hs, &store_path, "memo test", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "memo test", None, false, false, "", "", "", "", "").unwrap();
         let (_, dl0, _) = sync::check_pending(&cs, &http).await.unwrap().unwrap();
         check(dl0 == 1, &format!("new file pending ({dl0} to fetch)"));
         let alpha_local = sync_root
@@ -1238,7 +1242,7 @@ fn main() {
         // epsilon was only a memo-test fixture — remove it so later
         // sections see the original 6-jar folder again.
         std::fs::remove_file(&cur_folder.join("epsilon.jar")).unwrap();
-        sync::host_publish(&hs, &store_path, "drop epsilon", None, false).unwrap();
+        sync::host_publish(&hs, &store_path, "drop epsilon", None, false, false, "", "", "", "", "").unwrap();
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
         check(
             !sync_root
@@ -1262,7 +1266,7 @@ fn main() {
                 *b = rng as u8;
             }
             std::fs::write(&broken, &content).unwrap();
-            sync::host_publish(&hs, &store_path, "broken jar", None, false).unwrap();
+            sync::host_publish(&hs, &store_path, "broken jar", None, false, false, "", "", "", "", "").unwrap();
             let has_real_sha1 = hs
                 .lock()
                 .unwrap()
@@ -1286,7 +1290,7 @@ fn main() {
                 "member downloads non-zip jar byte-identical",
             );
             std::fs::remove_file(&broken).unwrap();
-            sync::host_publish(&hs, &store_path, "drop broken", None, false).unwrap();
+            sync::host_publish(&hs, &store_path, "drop broken", None, false, false, "", "", "", "", "").unwrap();
             sync::apply_update(&cs, &http, &store_path).await.unwrap();
         }
 
@@ -1509,6 +1513,7 @@ fn main() {
             "meta-net",
             "",
             "Fixed Pack",
+            "2.0",
             "1.20.1",
             "forge",
             "47.0.0",
@@ -1519,10 +1524,25 @@ fn main() {
             let h = g.as_ref().unwrap();
             check(
                 h.manifest.pack_name == "Fixed Pack"
+                    && h.manifest.pack_version == "2.0"
                     && h.manifest.mc_version == "1.20.1"
                     && h.manifest.loader == "forge"
                     && h.manifest.loader_version == "47.0.0",
                 "host_update edits live manifest meta",
+            );
+        }
+        // Force-republish identical files: bumps version, carries packVersion.
+        let pv = sync::host_publish(
+            &hs, &store_path, "re-push", None, false, true, "", "", "", "", "",
+        )
+        .unwrap();
+        check(pv.contains("v1"), &format!("force republish bumps ({pv})"));
+        {
+            let g = hs.lock().unwrap();
+            let h = g.as_ref().unwrap();
+            check(
+                h.manifest.pack_version == "2.0",
+                "republished manifest keeps pack_version",
             );
         }
         sync::host_stop(&hs, &store_path);

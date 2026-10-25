@@ -95,7 +95,7 @@ fn run_host(dir: &str) {
         "0.15.11",
     )
     .unwrap();
-    sync::host_publish(&hs, &e.store, "v1", None, false).unwrap();
+    sync::host_publish(&hs, &e.store, "v1", None, false, false, "", "", "", "", "").unwrap();
     println!("READY");
     std::io::stdout().flush().unwrap();
 
@@ -141,7 +141,7 @@ fn run_host(dir: &str) {
                     make_jar(&mods.join(fname), fname.trim_end_matches(".jar"), 8);
                     let _ = std::fs::write(&mods.join(fname), &body);
                     let note = format!("add {fname}");
-                    match sync::host_publish(&hs, &e.store, &note, None, false) {
+                    match sync::host_publish(&hs, &e.store, &note, None, false, false, "", "", "", "", "") {
                         Ok(l) => println!("PUBOK {l}"),
                         Err(err) => println!("PUBFAIL {err}"),
                     }

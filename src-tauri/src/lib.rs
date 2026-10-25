@@ -205,10 +205,20 @@ async fn load_into_launcher(
 ) -> Result<String, String> {
     let mods = state_mods(&state);
     match launcher.kind.as_str() {
-        "vanilla" | "tlauncher" => {
+        "vanilla" => {
             launchers::deploy_vanilla(&state.client, &mods, &config)
                 .await
                 .map_err(|e| e.to_string())
+        }
+        "tlauncher" => {
+            launchers::deploy_tlauncher(
+                &state.client,
+                &mods,
+                &config,
+                launcher.data_dir.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())
         }
         "prism" => {
             launchers::deploy_prism(
@@ -291,11 +301,29 @@ async fn host_publish(
     note: String,
     target: Option<u64>,
     allow_empty: bool,
+    force: bool,
+    pack_name: String,
+    pack_version: String,
+    mc_version: String,
+    loader: String,
+    loader_version: String,
 ) -> Result<String, String> {
     let host = state.host.clone();
     let sp = sync::store_path();
     tauri::async_runtime::spawn_blocking(move || {
-        sync::host_publish(&host, &sp, &note, target, allow_empty)
+        sync::host_publish(
+            &host,
+            &sp,
+            &note,
+            target,
+            allow_empty,
+            force,
+            &pack_name,
+            &pack_version,
+            &mc_version,
+            &loader,
+            &loader_version,
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -328,6 +356,7 @@ async fn host_update(
     name: String,
     code: String,
     pack_name: String,
+    pack_version: String,
     mc_version: String,
     loader: String,
     loader_version: String,
@@ -341,6 +370,7 @@ async fn host_update(
             &name,
             &code,
             &pack_name,
+            &pack_version,
             &mc_version,
             &loader,
             &loader_version,

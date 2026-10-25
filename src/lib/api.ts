@@ -204,6 +204,14 @@ export interface ConnectStatus {
   networkId: string | null;
   code: string | null;
   folder: string | null;
+  // host-side pack meta (confirmed at publish time)
+  packName: string | null;
+  packVersion: string | null;
+  mcVersion: string | null;
+  loader: string | null;
+  loaderVersion: string | null;
+  /** Folder the meta was last confirmed for — mismatch → re-suggest. */
+  metaFolder: string | null;
   latestVersion: number;
   history: { version: number; note: string; ts: number }[];
   hostAddr: string | null;
@@ -244,11 +252,32 @@ export const hostStart = (
     loaderVersion,
   });
 
+export interface PublishMeta {
+  packName: string;
+  packVersion: string;
+  mcVersion: string;
+  loader: string;
+  loaderVersion: string;
+}
+
 export const hostPublish = (
   note: string,
   target: number | null,
-  allowEmpty = false
-) => invoke<string>("host_publish", { note, target, allowEmpty });
+  allowEmpty = false,
+  force = false,
+  meta?: PublishMeta
+) =>
+  invoke<string>("host_publish", {
+    note,
+    target,
+    allowEmpty,
+    force,
+    packName: meta?.packName ?? "",
+    packVersion: meta?.packVersion ?? "",
+    mcVersion: meta?.mcVersion ?? "",
+    loader: meta?.loader ?? "",
+    loaderVersion: meta?.loaderVersion ?? "",
+  });
 
 export const hostSetFolder = (folder: string) =>
   invoke<{ samePct: number; fileCount: number }>("host_set_folder", {
@@ -259,6 +288,7 @@ export const hostUpdate = (
   name: string,
   code: string,
   packName: string,
+  packVersion: string,
   mcVersion: string,
   loader: string,
   loaderVersion: string
@@ -267,6 +297,7 @@ export const hostUpdate = (
     name,
     code,
     packName,
+    packVersion,
     mcVersion,
     loader,
     loaderVersion,

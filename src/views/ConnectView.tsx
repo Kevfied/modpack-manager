@@ -41,7 +41,7 @@ interface Props {
 const savedName = () => localStorage.getItem("mm-display-name") ?? "";
 const ts = (t: number) => new Date(t * 1000).toLocaleString();
 
-export default function ConnectView(props: Props) {
+export default function ConnectView(_props: Props) {
   const [status, setStatus] = useState<ConnectStatus | null>(null);
   const [found, setFound] = useState<FoundNetwork[]>([]);
   const [log, setLog] = useState<string[]>([]);
@@ -51,12 +51,17 @@ export default function ConnectView(props: Props) {
   const [netCode, setNetCode] = useState("");
   const [netReqCode, setNetReqCode] = useState(true);
   const [netFolder, setNetFolder] = useState("");
-  // Pack meta for the hosted folder — prefilled from Build settings, then
-  // auto-suggested from the jars themselves when a folder is picked.
-  const [pName, setPName] = useState(() => props.settings.name || "");
-  const [pMc, setPMc] = useState(() => props.settings.mcVersion || "");
-  const [pLoader, setPLoader] = useState(() => props.settings.loader || "");
-  const [pLoaderVer, setPLoaderVer] = useState(() => props.settings.loaderVersion || "");
+  // Publish dialog — pack meta is confirmed HERE, at publish time, not at
+  // host setup: a mods folder isn't a pack until you publish it.
+  const [pubOpen, setPubOpen] = useState(false);
+  const [pubStale, setPubStale] = useState(false);
+  const [pubMeta, setPubMeta] = useState({
+    name: "",
+    ver: "",
+    mc: "",
+    loader: "",
+    lv: "",
+  });
   const [note, setNote] = useState("");
   const [pubTarget, setPubTarget] = useState<number | "all">("all");
   // edit-network form (hosting view)
@@ -64,7 +69,7 @@ export default function ConnectView(props: Props) {
   const [editName, setEditName] = useState("");
   const [editCode, setEditCode] = useState("");
   const [editReqCode, setEditReqCode] = useState(true);
-  const [editMeta, setEditMeta] = useState({ name: "", mc: "", loader: "", lv: "" });
+  const [editMeta, setEditMeta] = useState({ name: "", ver: "", mc: "", loader: "", lv: "" });
   // join form
   const [joinAddr, setJoinAddr] = useState("");
   const [joinCode, setJoinCode] = useState("");
@@ -186,31 +191,22 @@ export default function ConnectView(props: Props) {
     const dir = await open({ directory: true, title: "Pick the mods folder to share" });
     if (typeof dir !== "string") return;
     setNetFolder(dir);
-    // Auto-suggest pack meta from the jars — only fills fields the user
-    // hasn't already typed into (Build-tab values still win).
-    suggestPackMeta(dir)
-      .then((s) => {
-        setPName((v) => v || s.packName);
-        setPMc((v) => v || s.mcVersion);
-        setPLoader((v) => v || s.loader);
-        setPLoaderVer((v) => v || s.loaderVersion);
-      })
-      .catch(() => {});
   };
 
   const doHost = async () => {
     setBusy(true);
     try {
-      const s = props.settings;
+      // Meta args left blank — the backend auto-detects them from the jars,
+      // and the publish dialog is where they get confirmed anyway.
       pushLog(
         await hostStart(
           netName || "My Network",
           netReqCode ? netCode : "",
           netFolder,
-          pName || s.name || netName || "My Modpack",
-          pMc,
-          pLoader,
-          pLoaderVer
+          "",
+          "",
+          "",
+          ""
         )
       );
       await refresh();
@@ -221,22 +217,83 @@ export default function ConnectView(props: Props) {
     }
   };
 
-  const doPublish = async (allowEmpty = false) => {
+  // The publish dialog prefills from the last confirmed meta. When the
+  // shared folder moved underneath it (metaFolder ≠ folder), the old meta
+  // describes a different pack → re-suggest from the new jars and warn.
+  const openPublish = async () => {
+    if (!status?.folder) return;
+    const stale = !!status.metaFolder && status.metaFolder !== status.folder;
+    const meta = {
+      name: status.packName || "",
+      ver: status.packVersion || "",
+      mc: status.mcVersion || "",
+      loader: status.loader || "",
+      lv: status.loaderVersion || "",
+    };
+    if (stale) {
+      try {
+        const s = await suggestPackMeta(status.folder);
+        meta.name = s.packName || meta.name;
+        meta.mc = s.mcVersion || meta.mc;
+        meta.loader = s.loader || meta.loader;
+        meta.lv = s.loaderVersion || meta.lv;
+        meta.ver = "";
+      } catch { /* keep whatever the status gave us */ }
+    }
+    setPubMeta(meta);
+    setPubStale(stale);
+    setPubOpen(true);
+  };
+
+  const confirmPublish = async () => {
+    const { name, mc, loader } = pubMeta;
+    if (!name.trim() || !mc.trim() || !loader.trim()) {
+      pushLog("x pack name, MC version and loader are required to publish");
+      return;
+    }
+    setPubOpen(false);
+    await doPublish(false, false);
+  };
+
+  const doPublish = async (force = false, allowEmpty = false) => {
     setBusy(true);
     try {
-      pushLog(await hostPublish(note, pubTarget === "all" ? null : pubTarget, allowEmpty));
+      pushLog(
+        await hostPublish(
+          note,
+          pubTarget === "all" ? null : pubTarget,
+          allowEmpty,
+          force,
+          {
+            packName: pubMeta.name,
+            packVersion: pubMeta.ver,
+            mcVersion: pubMeta.mc,
+            loader: pubMeta.loader,
+            loaderVersion: pubMeta.lv,
+          }
+        )
+      );
       setNote("");
       setPubTarget("all");
       await refresh();
     } catch (e) {
       const msg = String(e);
+      if (msg.includes("UNCHANGED")) {
+        setBusy(false);
+        const ok = await confirm(
+          "Nothing changed since the last publish — same files, same hashes.\n\nRepublish anyway? Members can re-apply to repair a broken copy.",
+          { title: "Republish unchanged", okLabel: "Republish", cancelLabel: "Cancel" }
+        );
+        if (ok) await doPublish(true, allowEmpty);
+        return;
+      }
       if (msg.includes("EMPTY_PACK")) {
+        setBusy(false);
         const ok = await confirm(
           "The mods folder is empty — publishing would remove every mod on every member.\n\nPublish an empty pack anyway?",
           { title: "Empty pack", okLabel: "Publish anyway", cancelLabel: "Cancel" }
         );
-        setBusy(false);
-        if (ok) await doPublish(true);
+        if (ok) await doPublish(force, true);
         return;
       }
       pushLog(`x ${msg}`);
@@ -308,6 +365,7 @@ export default function ConnectView(props: Props) {
           editName,
           editReqCode ? editCode : "",
           editMeta.name,
+          editMeta.ver,
           editMeta.mc,
           editMeta.loader,
           editMeta.lv
@@ -565,6 +623,12 @@ export default function ConnectView(props: Props) {
                 onChange={(e) => setEditMeta((m) => ({ ...m, name: e.target.value }))}
                 placeholder="keep current"
               />
+              <label>Pack version</label>
+              <input
+                value={editMeta.ver}
+                onChange={(e) => setEditMeta((m) => ({ ...m, ver: e.target.value }))}
+                placeholder="keep current"
+              />
               <label>MC version</label>
               <input
                 value={editMeta.mc}
@@ -601,13 +665,6 @@ export default function ConnectView(props: Props) {
             </div>
           )}
           <div className="toolbar">
-            <input
-              type="text"
-              placeholder="Update note (optional)…"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              style={{ flex: 1 }}
-            />
             <select
               value={pubTarget}
               onChange={(e) =>
@@ -625,8 +682,8 @@ export default function ConnectView(props: Props) {
                   </option>
                 ))}
             </select>
-            <button className="primary" onClick={() => doPublish()} disabled={busy}>
-              Publish update
+            <button className="primary" onClick={openPublish} disabled={busy}>
+              Publish update…
             </button>
             <button onClick={async () => { await hostStop(); await refresh(); }}>
               Stop hosting
@@ -848,6 +905,73 @@ export default function ConnectView(props: Props) {
             </div>
           </div>
         )}
+        {pubOpen && (
+          <div className="upd-overlay" onClick={() => setPubOpen(false)}>
+            <div className="upd-card" onClick={(e) => e.stopPropagation()} style={{ minWidth: 340 }}>
+              <h3>Publish pack update</h3>
+              {pubStale && (
+                <p className="upd-warn">
+                  The shared folder changed since this pack meta was saved —
+                  fields were re-detected from the new jars. Check them.
+                </p>
+              )}
+              <div className="form-grid" style={{ marginTop: 10 }}>
+                <label>Pack name</label>
+                <input
+                  value={pubMeta.name}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, name: e.target.value }))}
+                  placeholder="My Modpack"
+                  autoFocus
+                />
+                <label>Pack version</label>
+                <input
+                  value={pubMeta.ver}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, ver: e.target.value }))}
+                  placeholder="e.g. 1.0 / beta 3 (optional)"
+                />
+                <label>MC version *</label>
+                <input
+                  value={pubMeta.mc}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, mc: e.target.value }))}
+                  placeholder="e.g. 1.21.1"
+                />
+                <label>Loader *</label>
+                <select
+                  value={pubMeta.loader}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, loader: e.target.value }))}
+                >
+                  <option value="">pick one…</option>
+                  <option value="fabric">fabric</option>
+                  <option value="forge">forge</option>
+                  <option value="neoforge">neoforge</option>
+                  <option value="quilt">quilt</option>
+                </select>
+                <label>Loader version</label>
+                <input
+                  value={pubMeta.lv}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, lv: e.target.value }))}
+                  placeholder="blank = latest"
+                />
+                <label>Update note</label>
+                <input
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="optional"
+                />
+              </div>
+              <div className="upd-actions">
+                <button
+                  className="primary"
+                  onClick={confirmPublish}
+                  disabled={busy || !pubMeta.name.trim() || !pubMeta.mc.trim() || !pubMeta.loader}
+                >
+                  Publish
+                </button>
+                <button onClick={() => setPubOpen(false)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -883,36 +1007,10 @@ export default function ConnectView(props: Props) {
             <button onClick={pickFolder}>Pick folder…</button>
             {netFolder && <span className="dim mono">{netFolder}</span>}
           </div>
-          <label>Pack name</label>
-          <input
-            value={pName}
-            onChange={(e) => setPName(e.target.value)}
-            placeholder={props.settings.name || "My Modpack"}
-          />
-          <label>MC version</label>
-          <input
-            value={pMc}
-            onChange={(e) => setPMc(e.target.value)}
-            placeholder="auto-detected from jars"
-          />
-          <label>Loader</label>
-          <select value={pLoader} onChange={(e) => setPLoader(e.target.value)}>
-            <option value="">auto</option>
-            <option value="fabric">fabric</option>
-            <option value="forge">forge</option>
-            <option value="neoforge">neoforge</option>
-            <option value="quilt">quilt</option>
-          </select>
-          <label>Loader version</label>
-          <input
-            value={pLoaderVer}
-            onChange={(e) => setPLoaderVer(e.target.value)}
-            placeholder="latest"
-          />
         </div>
         <div className="dim" style={{ margin: "8px 0" }}>
-          Blank fields auto-detect from the jars — members need MC + loader to
-          install the pack into a launcher.
+          Pack details are asked at publish time — a mods folder isn't a
+          modpack until you publish it.
         </div>
         <button className="primary" onClick={doHost} disabled={busy || !netFolder}>
           Start hosting

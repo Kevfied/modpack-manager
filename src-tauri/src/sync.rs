@@ -96,6 +96,10 @@ pub struct Manifest {
     pub network_id: String,
     #[serde(rename = "packName")]
     pub pack_name: String,
+    /// Human-readable pack version the host picked ("1.3", "beta 2") —
+    /// display only; `version` is still the monotonic sync counter.
+    #[serde(rename = "packVersion", default)]
+    pub pack_version: String,
     pub version: u64,
     pub note: String,
     #[serde(rename = "mcVersion")]
@@ -179,6 +183,20 @@ pub struct ConnectStatus {
     pub network_id: Option<String>,
     pub code: Option<String>,
     pub folder: Option<String>,
+    /// Pack meta shown/edited at publish time (host only).
+    #[serde(rename = "packName")]
+    pub pack_name: Option<String>,
+    #[serde(rename = "packVersion")]
+    pub pack_version: Option<String>,
+    #[serde(rename = "mcVersion")]
+    pub mc_version: Option<String>,
+    pub loader: Option<String>,
+    #[serde(rename = "loaderVersion")]
+    pub loader_version: Option<String>,
+    /// Folder the pack meta was last confirmed for — a mismatch means the
+    /// folder moved underneath the meta → re-suggest instead of prefilling.
+    #[serde(rename = "metaFolder")]
+    pub meta_folder: Option<String>,
     #[serde(rename = "latestVersion")]
     pub latest_version: u64,
     pub history: Vec<serde_json::Value>,
@@ -220,9 +238,13 @@ pub struct HostState {
     pub code: String,
     pub folder: PathBuf,
     pub pack_name: String,
+    pub pack_version: String,
     pub mc_version: String,
     pub loader: String,
     pub loader_version: String,
+    /// Folder the pack meta was last confirmed/edited for — the publish
+    /// dialog re-suggests when this doesn't match `folder`.
+    pub meta_folder: Option<String>,
     pub manifest: Manifest,
     /// member_id -> a manifest served only to that member (targeted publish).
     /// Versions share `counter` with the global stream so they never collide.
@@ -288,11 +310,15 @@ pub struct SavedHost {
     pub network_id: String,
     #[serde(rename = "packName")]
     pub pack_name: String,
+    #[serde(rename = "packVersion", default)]
+    pub pack_version: String,
     #[serde(rename = "mcVersion")]
     pub mc_version: String,
     pub loader: String,
     #[serde(rename = "loaderVersion")]
     pub loader_version: String,
+    #[serde(rename = "metaFolder", default)]
+    pub meta_folder: Option<String>,
     /// Last explicitly published manifest — restored verbatim on restart.
     /// Publishing is NEVER automatic, so this is always a human action.
     #[serde(default)]
@@ -356,9 +382,11 @@ fn save_host(store_path: &Path, h: &HostState) {
         folder: h.folder.to_string_lossy().into_owned(),
         network_id: h.network_id.clone(),
         pack_name: h.pack_name.clone(),
+        pack_version: h.pack_version.clone(),
         mc_version: h.mc_version.clone(),
         loader: h.loader.clone(),
         loader_version: h.loader_version.clone(),
+        meta_folder: h.meta_folder.clone(),
         manifest: Some(h.manifest.clone()),
         counter: h.counter,
         history: h.history.clone(),
@@ -534,11 +562,22 @@ pub fn host_start(
     } else {
         loader.into()
     };
+    // Pack name defaults to the shared folder's basename — friendlier than a
+    // blank pack name in announcements before the first publish.
+    let pack_name = if pack_name.trim().is_empty() {
+        folder_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "My Modpack".into())
+    } else {
+        pack_name.to_string()
+    };
     // STRICT: nothing is published until the Publish button is pressed.
     // The manifest starts at v0 / empty — clients see "nothing published".
     let manifest = Manifest {
         network_id: network_id.clone(),
-        pack_name: pack_name.to_string(),
+        pack_name: pack_name.clone(),
+        pack_version: String::new(),
         version: 0,
         note: String::new(),
         mc_version: mc_version.clone(),
@@ -551,11 +590,15 @@ pub fn host_start(
         network_id,
         name: name.to_string(),
         code: code.to_string(),
-        folder: folder_path,
-        pack_name: pack_name.into(),
+        folder: folder_path.clone(),
+        pack_name,
+        pack_version: String::new(),
         mc_version,
         loader,
         loader_version: loader_version.into(),
+        // Auto-detected at start — counts as "for this folder" so the first
+        // publish dialog prefills instead of rescanning.
+        meta_folder: Some(folder.to_string()),
         history: vec![],
         manifest,
         targets: HashMap::new(),
@@ -598,6 +641,7 @@ fn host_resume(hs: &SharedHost, store_path: &Path, saved: &SavedHost) -> Result<
     let manifest = saved.manifest.clone().unwrap_or_else(|| Manifest {
         network_id: saved.network_id.clone(),
         pack_name: saved.pack_name.clone(),
+        pack_version: saved.pack_version.clone(),
         version: 0,
         note: String::new(),
         mc_version: saved.mc_version.clone(),
@@ -612,9 +656,11 @@ fn host_resume(hs: &SharedHost, store_path: &Path, saved: &SavedHost) -> Result<
         code: saved.code.clone(),
         folder: PathBuf::from(&saved.folder),
         pack_name: saved.pack_name.clone(),
+        pack_version: saved.pack_version.clone(),
         mc_version: saved.mc_version.clone(),
         loader: saved.loader.clone(),
         loader_version: saved.loader_version.clone(),
+        meta_folder: saved.meta_folder.clone(),
         manifest,
         targets: HashMap::new(),
         counter: saved.counter,
@@ -654,6 +700,7 @@ pub fn host_update(
     name: &str,
     code: &str,
     pack_name: &str,
+    pack_version: &str,
     mc_version: &str,
     loader: &str,
     loader_version: &str,
@@ -668,6 +715,9 @@ pub fn host_update(
     if !pack_name.trim().is_empty() {
         h.pack_name = pack_name.trim().into();
     }
+    if !pack_version.trim().is_empty() {
+        h.pack_version = pack_version.trim().into();
+    }
     if !mc_version.trim().is_empty() {
         h.mc_version = mc_version.trim().into();
     }
@@ -678,15 +728,19 @@ pub fn host_update(
         h.loader_version = loader_version.trim().into();
     }
     h.manifest.pack_name = h.pack_name.clone();
+    h.manifest.pack_version = h.pack_version.clone();
     h.manifest.mc_version = h.mc_version.clone();
     h.manifest.loader = h.loader.clone();
     h.manifest.loader_version = h.loader_version.clone();
     for m in h.targets.values_mut() {
         m.pack_name = h.pack_name.clone();
+        m.pack_version = h.pack_version.clone();
         m.mc_version = h.mc_version.clone();
         m.loader = h.loader.clone();
         m.loader_version = h.loader_version.clone();
     }
+    // Explicitly edited → this meta is confirmed for the current folder.
+    h.meta_folder = Some(h.folder.to_string_lossy().into_owned());
     crate::alog!(
         "host",
         "network updated — \"{}\"{} (pack \"{}\" {} {})",
@@ -752,12 +806,22 @@ pub fn host_stop(hs: &SharedHost, store_path: &Path) {
 /// numbers can't collide with future global publishes.
 /// `allow_empty` — the UI confirms before passing true; publishing an empty
 /// folder would delete every mod on every member.
+/// `force` — republish even when files are identical; without it an
+/// unchanged folder fails with UNCHANGED and the UI asks to confirm.
+/// Pack-meta params come from the publish dialog; empty fields keep current.
+#[allow(clippy::too_many_arguments)]
 pub fn host_publish(
     hs: &SharedHost,
     store_path: &Path,
     note: &str,
     target: Option<u64>,
     allow_empty: bool,
+    force: bool,
+    pack_name: &str,
+    pack_version: &str,
+    mc_version: &str,
+    loader: &str,
+    loader_version: &str,
 ) -> Result<String> {
     // Hash outside the lock — build_file_list sha1s every file, and holding
     // the mutex across it stalled heartbeats/manifests for the duration.
@@ -778,16 +842,44 @@ pub fn host_publish(
     }
     // No-change guard: for a targeted publish, only compare against that
     // member's previous target — republishing the global content TO a member
-    // is legitimate (e.g. they declined the global update).
+    // is legitimate (e.g. they declined the global update). UNCHANGED is a
+    // sentinel the UI confirms past, retrying with force=true.
     let baseline = match target {
         Some(m) => h.targets.get(&m),
         None => Some(&h.manifest),
     };
-    if let Some(b) = baseline {
-        if files_eq(&files, &b.files) {
-            return Ok("! nothing changed since last publish".into());
+    if !force {
+        if let Some(b) = baseline {
+            if files_eq(&files, &b.files) {
+                anyhow::bail!("UNCHANGED");
+            }
         }
     }
+    // Meta confirmed in the publish dialog — empty fields keep current.
+    // Updating the live manifests makes it visible on members' next check.
+    if !pack_name.trim().is_empty() {
+        h.pack_name = pack_name.trim().into();
+    }
+    if !pack_version.trim().is_empty() {
+        h.pack_version = pack_version.trim().into();
+    }
+    if !mc_version.trim().is_empty() {
+        h.mc_version = mc_version.trim().into();
+    }
+    if !loader.trim().is_empty() {
+        h.loader = loader.trim().into();
+    }
+    if !loader_version.trim().is_empty() {
+        h.loader_version = loader_version.trim().into();
+    }
+    for m in std::iter::once(&mut h.manifest).chain(h.targets.values_mut()) {
+        m.pack_name = h.pack_name.clone();
+        m.pack_version = h.pack_version.clone();
+        m.mc_version = h.mc_version.clone();
+        m.loader = h.loader.clone();
+        m.loader_version = h.loader_version.clone();
+    }
+    h.meta_folder = Some(h.folder.to_string_lossy().into_owned());
     h.counter += 1;
     let version = h.counter;
     let mut m = h.manifest.clone();
@@ -2376,6 +2468,7 @@ pub async fn apply_update_progress(
             "networkId": nid,
             "name": manifest.pack_name,
             "version": manifest.version,
+            "packVersion": manifest.pack_version,
             "mcVersion": manifest.mc_version,
             "loader": manifest.loader,
             "loaderVersion": manifest.loader_version,
@@ -2526,9 +2619,14 @@ pub async fn load_synced_pack(
     let dir = root.join("_synced").join(network_id);
     let meta = std::fs::read_to_string(dir.join("pack.json")).context("pack.json missing — apply the update first")?;
     let v: serde_json::Value = serde_json::from_str(&meta)?;
+    let pack_version = v["packVersion"].as_str().unwrap_or("");
     let mut cfg = pack::PackConfig {
         name: v["name"].as_str().unwrap_or("Synced Pack").to_string(),
-        version: format!("v{}", v["version"].as_u64().unwrap_or(0)),
+        version: if pack_version.is_empty() {
+            format!("v{}", v["version"].as_u64().unwrap_or(0))
+        } else {
+            pack_version.to_string()
+        },
         summary: String::new(),
         mc_version: v["mcVersion"].as_str().unwrap_or("").to_string(),
         loader: v["loader"].as_str().unwrap_or("fabric").to_string(),
@@ -2583,6 +2681,26 @@ pub async fn load_synced_pack(
                 cfg.loader, cfg.loader_version
             ));
         }
+        "tlauncher" => {
+            let mc = launcher
+                .data_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(launchers::tlauncher_gamedir)
+                .context("TLauncher game dir not found")?;
+            let gamedir =
+                launchers::tlauncher_stage_version(client, &mc, &cfg, &mut log).await?;
+            let (n, removed) = sync_jars(&mods_dir, &gamedir.join("mods"))?;
+            log.push_str(&format!("✓ staged {n} mod(s)\n"));
+            if removed > 0 {
+                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
+            }
+            log.push_str(&format!(
+                "✓ \"{}\" in TLauncher version list — open TLauncher, pick it, press Play",
+                cfg.name
+            ));
+        }
         _ => {
             let mc = launchers::minecraft_dir().context(".minecraft not found")?;
             let instance = root.join(pack::slugify(&cfg.name));
@@ -2629,6 +2747,12 @@ pub async fn connect_status(
             network_id: Some(h.network_id.clone()),
             code: Some(h.code.clone()),
             folder: Some(h.folder.to_string_lossy().into_owned()),
+            pack_name: Some(h.pack_name.clone()),
+            pack_version: Some(h.pack_version.clone()),
+            mc_version: Some(h.mc_version.clone()),
+            loader: Some(h.loader.clone()),
+            loader_version: Some(h.loader_version.clone()),
+            meta_folder: h.meta_folder.clone(),
             latest_version: h.manifest.version,
             history: h
                 .history
@@ -2695,6 +2819,12 @@ pub async fn connect_status(
             network_id: Some(c.network_id.clone()),
             code: None,
             folder: None,
+            pack_name: None,
+            pack_version: None,
+            mc_version: None,
+            loader: None,
+            loader_version: None,
+            meta_folder: None,
             latest_version: c.latest_version,
             history: vec![],
             host_addr: Some(c.host_addr.clone()),
@@ -2718,6 +2848,12 @@ fn idle_status() -> ConnectStatus {
         network_id: None,
         code: None,
         folder: None,
+        pack_name: None,
+        pack_version: None,
+        mc_version: None,
+        loader: None,
+        loader_version: None,
+        meta_folder: None,
         latest_version: 0,
         history: vec![],
         host_addr: None,
