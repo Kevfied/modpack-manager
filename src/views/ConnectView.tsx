@@ -731,6 +731,76 @@ export default function ConnectView(_props: Props) {
             ))}
           </div>
         )}
+        {pubOpen && (
+          <div className="upd-overlay" onClick={() => setPubOpen(false)}>
+            <div className="upd-card" onClick={(e) => e.stopPropagation()} style={{ minWidth: 340 }}>
+              <h3>Publish pack update</h3>
+              {pubStale && (
+                <p className="upd-warn">
+                  The shared folder changed since this pack meta was saved —
+                  fields were re-detected from the new jars. Check them.
+                </p>
+              )}
+              <div className="form-grid" style={{ marginTop: 10 }}>
+                <label>Pack name</label>
+                <input
+                  value={pubMeta.name}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, name: e.target.value }))}
+                  placeholder="My Modpack"
+                  autoFocus
+                />
+                <label>Pack version</label>
+                <input
+                  value={pubMeta.ver}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, ver: e.target.value }))}
+                  placeholder="e.g. 1.0 / beta 3 (optional)"
+                />
+                <label>MC version *</label>
+                <input
+                  value={pubMeta.mc}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, mc: e.target.value }))}
+                  placeholder="e.g. 1.21.1"
+                />
+                <label>Loader *</label>
+                <select
+                  value={pubMeta.loader}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, loader: e.target.value }))}
+                >
+                  <option value="">pick one…</option>
+                  <option value="fabric">fabric</option>
+                  <option value="forge">forge</option>
+                  <option value="neoforge">neoforge</option>
+                  <option value="quilt">quilt</option>
+                </select>
+                <label>Loader version</label>
+                <input
+                  value={pubMeta.lv}
+                  onChange={(e) => setPubMeta((m) => ({ ...m, lv: e.target.value }))}
+                  placeholder="blank = latest"
+                />
+                <label>Update note</label>
+                <input
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="optional"
+                />
+              </div>
+              <div className="upd-actions">
+                <button
+                  className="primary"
+                  onClick={confirmPublish}
+                  disabled={busy}
+                >
+                  Publish
+                </button>
+                <button onClick={() => setPubOpen(false)}>Cancel</button>
+                {(!pubMeta.name.trim() || !pubMeta.mc.trim() || !pubMeta.loader) && (
+                  <span className="dim">pack name, MC version and loader are required</span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -915,76 +985,6 @@ export default function ConnectView(_props: Props) {
               )}
               <div className="upd-actions">
                 <button onClick={() => setPickerOpen(false)}>Later</button>
-              </div>
-            </div>
-          </div>
-        )}
-        {pubOpen && (
-          <div className="upd-overlay" onClick={() => setPubOpen(false)}>
-            <div className="upd-card" onClick={(e) => e.stopPropagation()} style={{ minWidth: 340 }}>
-              <h3>Publish pack update</h3>
-              {pubStale && (
-                <p className="upd-warn">
-                  The shared folder changed since this pack meta was saved —
-                  fields were re-detected from the new jars. Check them.
-                </p>
-              )}
-              <div className="form-grid" style={{ marginTop: 10 }}>
-                <label>Pack name</label>
-                <input
-                  value={pubMeta.name}
-                  onChange={(e) => setPubMeta((m) => ({ ...m, name: e.target.value }))}
-                  placeholder="My Modpack"
-                  autoFocus
-                />
-                <label>Pack version</label>
-                <input
-                  value={pubMeta.ver}
-                  onChange={(e) => setPubMeta((m) => ({ ...m, ver: e.target.value }))}
-                  placeholder="e.g. 1.0 / beta 3 (optional)"
-                />
-                <label>MC version *</label>
-                <input
-                  value={pubMeta.mc}
-                  onChange={(e) => setPubMeta((m) => ({ ...m, mc: e.target.value }))}
-                  placeholder="e.g. 1.21.1"
-                />
-                <label>Loader *</label>
-                <select
-                  value={pubMeta.loader}
-                  onChange={(e) => setPubMeta((m) => ({ ...m, loader: e.target.value }))}
-                >
-                  <option value="">pick one…</option>
-                  <option value="fabric">fabric</option>
-                  <option value="forge">forge</option>
-                  <option value="neoforge">neoforge</option>
-                  <option value="quilt">quilt</option>
-                </select>
-                <label>Loader version</label>
-                <input
-                  value={pubMeta.lv}
-                  onChange={(e) => setPubMeta((m) => ({ ...m, lv: e.target.value }))}
-                  placeholder="blank = latest"
-                />
-                <label>Update note</label>
-                <input
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="optional"
-                />
-              </div>
-              <div className="upd-actions">
-                <button
-                  className="primary"
-                  onClick={confirmPublish}
-                  disabled={busy}
-                >
-                  Publish
-                </button>
-                <button onClick={() => setPubOpen(false)}>Cancel</button>
-                {(!pubMeta.name.trim() || !pubMeta.mc.trim() || !pubMeta.loader) && (
-                  <span className="dim">pack name, MC version and loader are required</span>
-                )}
               </div>
             </div>
           </div>
