@@ -660,7 +660,7 @@ fn host_resume(hs: &SharedHost, store_path: &Path, saved: &SavedHost) -> Result<
         mc_version: saved.mc_version.clone(),
         loader: saved.loader.clone(),
         loader_version: saved.loader_version.clone(),
-        meta_folder: saved.meta_folder.clone(),
+        meta_folder: saved.meta_folder.clone().filter(|s| !s.is_empty()),
         manifest,
         targets: HashMap::new(),
         counter: saved.counter,

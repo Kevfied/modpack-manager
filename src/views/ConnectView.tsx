@@ -217,32 +217,39 @@ export default function ConnectView(_props: Props) {
     }
   };
 
-  // The publish dialog prefills from the last confirmed meta. When the
-  // shared folder moved underneath it (metaFolder ≠ folder), the old meta
-  // describes a different pack → re-suggest from the new jars and warn.
-  const openPublish = async () => {
+  // The publish dialog prefills from the last confirmed meta and opens
+  // instantly. When meta is incomplete (fresh/resumed host) or the folder
+  // moved underneath it (metaFolder ≠ folder), a jar scan re-suggests in
+  // the background and fills only fields that are still empty.
+  const openPublish = () => {
     if (!status?.folder) return;
     const stale = !!status.metaFolder && status.metaFolder !== status.folder;
     const meta = {
       name: status.packName || "",
-      ver: status.packVersion || "",
+      // A folder swap invalidates the old pack's version string too.
+      ver: stale ? "" : status.packVersion || "",
       mc: status.mcVersion || "",
       loader: status.loader || "",
       lv: status.loaderVersion || "",
     };
-    if (stale) {
-      try {
-        const s = await suggestPackMeta(status.folder);
-        meta.name = s.packName || meta.name;
-        meta.mc = s.mcVersion || meta.mc;
-        meta.loader = s.loader || meta.loader;
-        meta.lv = s.loaderVersion || meta.lv;
-        meta.ver = "";
-      } catch { /* keep whatever the status gave us */ }
-    }
+    const incomplete = !meta.name.trim() || !meta.mc.trim() || !meta.loader;
     setPubMeta(meta);
     setPubStale(stale);
     setPubOpen(true);
+    if (stale || incomplete) {
+      const folder = status.folder;
+      suggestPackMeta(folder)
+        .then((s) =>
+          setPubMeta((m) => ({
+            name: m.name || s.packName || "",
+            ver: m.ver,
+            mc: m.mc || s.mcVersion || "",
+            loader: m.loader || s.loader || "",
+            lv: m.lv || s.loaderVersion || "",
+          }))
+        )
+        .catch(() => {});
+    }
   };
 
   const confirmPublish = async () => {
@@ -963,11 +970,14 @@ export default function ConnectView(_props: Props) {
                 <button
                   className="primary"
                   onClick={confirmPublish}
-                  disabled={busy || !pubMeta.name.trim() || !pubMeta.mc.trim() || !pubMeta.loader}
+                  disabled={busy}
                 >
                   Publish
                 </button>
                 <button onClick={() => setPubOpen(false)}>Cancel</button>
+                {(!pubMeta.name.trim() || !pubMeta.mc.trim() || !pubMeta.loader) && (
+                  <span className="dim">pack name, MC version and loader are required</span>
+                )}
               </div>
             </div>
           </div>

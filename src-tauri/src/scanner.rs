@@ -69,6 +69,35 @@ pub fn scan_paths<F>(paths: Vec<PathBuf>, on_progress: F) -> Result<ScanResult>
 where
     F: Fn(usize, usize) + Sync,
 {
+    scan_paths_impl(paths, true, on_progress)
+}
+
+/// Meta-only scan: parses jar manifests WITHOUT hashing contents. Used by
+/// Connect's publish dialog suggestion — a full hash of a multi-GB folder
+/// would stall the UI for seconds.
+pub fn scan_folder_meta(path: &str) -> Result<ScanResult> {
+    let root = Path::new(path);
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {path}");
+    }
+    let mut jars: Vec<PathBuf> = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            if let Some(ext) = entry.path().extension() {
+                if ext.eq_ignore_ascii_case("jar") {
+                    jars.push(entry.path().to_path_buf());
+                }
+            }
+        }
+    }
+    scan_paths_impl(jars, false, |_, _| {})
+}
+
+fn scan_paths_impl<F>(paths: Vec<PathBuf>, hash: bool, on_progress: F) -> Result<ScanResult>
+where
+    F: Fn(usize, usize) + Sync,
+{
     let mut jars: Vec<PathBuf> = paths
         .into_iter()
         .filter(|p| {
@@ -86,7 +115,7 @@ where
     let mut mods: Vec<ModInfo> = jars
         .par_iter()
         .map(|jar| {
-            let m = match inspect_jar(jar) {
+            let m = match inspect_jar(jar, hash) {
                 Ok(m) => m,
                 Err(e) => ModInfo {
                     path: jar.to_string_lossy().to_string(),
@@ -116,7 +145,7 @@ where
     Ok(ScanResult { mods, total_size: total })
 }
 
-fn inspect_jar(path: &Path) -> Result<ModInfo> {
+fn inspect_jar(path: &Path, hash: bool) -> Result<ModInfo> {
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -125,8 +154,13 @@ fn inspect_jar(path: &Path) -> Result<ModInfo> {
     // Single open: stream the whole file once through both hashers,
     // then rewind and hand the same handle to the zip reader.
     let mut file = BufReader::new(File::open(path).context("open jar")?);
-    let (sha1_hex, sha512_hex, size) = hash_reader(&mut file)?;
-    file.seek(std::io::SeekFrom::Start(0))?;
+    let (sha1_hex, sha512_hex, size) = if hash {
+        let h = hash_reader(&mut file)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        h
+    } else {
+        (String::new(), String::new(), std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+    };
 
     let mut info = ModInfo {
         path: path.to_string_lossy().to_string(),

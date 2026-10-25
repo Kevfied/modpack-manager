@@ -391,7 +391,7 @@ async fn suggest_pack_meta(
 ) -> Result<serde_json::Value, String> {
     let f = folder.clone();
     let res = tauri::async_runtime::spawn_blocking(move || {
-        scanner::scan_folder_progress(&f, |_, _| {})
+        scanner::scan_folder_meta(&f)
     })
     .await
     .map_err(|e| e.to_string())?
