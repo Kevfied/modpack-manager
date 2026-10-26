@@ -886,6 +886,15 @@ pub fn run() {
                 let _ = h.emit("appupdate-offer", ());
             });
 
+            // Resume saved host/client sessions EAGERLY — the lazy resume
+            // on the first connect_status poll means a --tray cold start
+            // whose default view isn't Connect would never re-host until
+            // someone opened the tab. Sessions must not depend on the UI.
+            if let Ok(root) = sync::synced_root() {
+                sync::resume(&st.host, &st.sync_client, &sync::store_path(), &root);
+                st.resumed.store(true, Ordering::Relaxed);
+            }
+
             // Tray: X hides to the icon; real quit lives on the menu.
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
