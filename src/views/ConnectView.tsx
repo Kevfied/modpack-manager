@@ -42,6 +42,15 @@ interface Props {
 const savedName = () => localStorage.getItem("mm-display-name") ?? "";
 const ts = (t: number) => new Date(t * 1000).toLocaleString();
 
+/** "3m ago" for stale found-network entries. */
+const ago = (t: number) => {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
+
 export default function ConnectView(_props: Props) {
   const [status, setStatus] = useState<ConnectStatus | null>(null);
   const [found, setFound] = useState<FoundNetwork[]>([]);
@@ -82,6 +91,11 @@ export default function ConnectView(_props: Props) {
   const [launchers, setLaunchers] = useState<LauncherInfo[]>([]);
   const [syncedPack, setSyncedPack] = useState<SyncedPackInfo | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // The "?" guide — member-only, teaches the joined flow step by step.
+  const [guideOpen, setGuideOpen] = useState(false);
+  // Which detected launcher already holds the pack — powers the
+  // persistent "installed ✓" state and the guide's last step.
+  const [installedIn, setInstalledIn] = useState<string | null>(null);
   // live download progress while apply_update streams files
   const [applyProg, setApplyProg] = useState<ApplyProgress | null>(null);
   // Byte samples for the download speed/ETA readout.
@@ -151,12 +165,21 @@ export default function ConnectView(_props: Props) {
   useEffect(() => {
     if (!joined || applied === 0) return;
     const load = () => {
-      detectLaunchers()
-        .then((d) => setLaunchers(d.launchers))
-        .catch((e) => pushLog(`x launcher detection: ${e}`));
       listSyncedPacks()
-        .then((packs) => setSyncedPack(packs.find((p) => p.networkId === nid) ?? null))
-        .catch(() => {});
+        .then(async (packs) => {
+          const p = packs.find((p) => p.networkId === nid) ?? null;
+          setSyncedPack(p);
+          const name = p?.name || status?.networkName || "Synced Pack";
+          const d = await detectLaunchers();
+          setLaunchers(d.launchers);
+          // Which launcher (if any) already holds this pack — drives the
+          // persistent "installed ✓" state + the guide's done step.
+          const hits = await Promise.all(
+            d.launchers.map(async (l) => ((await packExists(l, name)) ? l.name : null))
+          );
+          setInstalledIn(hits.find((x) => x) ?? null);
+        })
+        .catch((e) => pushLog(`x launcher detection: ${e}`));
     };
     load();
     const t = window.setInterval(() => {
@@ -181,6 +204,7 @@ export default function ConnectView(_props: Props) {
     pushLog(`> ${l.name}: installing "${name}" v${applied}…`);
     try {
       pushLog(await loadSyncedPack(nid, l));
+      setInstalledIn(l.name); // instant "go play" — poll confirms later
     } catch (e) {
       pushLog(`x ${e}`);
     } finally {
@@ -807,6 +831,94 @@ export default function ConnectView(_props: Props) {
 
   // ---- joined view ----
   if (status?.mode === "joined") {
+    const packName =
+      syncedPack?.name || status.packName || status.networkName || "the pack";
+    const downloading =
+      !!applyProg &&
+      applyProg.phase !== "done" &&
+      applyProg.phase !== "cancelled";
+    // Live guide steps — each reads current status, so the panel checks
+    // off what the member already did and points at what's next.
+    const guideSteps: { icon: string; text: string; cls: string }[] = [
+      {
+        icon: "✓",
+        text: `Connected to "${status.networkName}" as ${status.displayName}`,
+        cls: "done",
+      },
+    ];
+    if (downloading) {
+      guideSteps.push({
+        icon: "→",
+        text: "Downloading the pack — wait for it to finish",
+        cls: "now",
+      });
+    } else if (!status.hostOnline) {
+      guideSteps.push({
+        icon: "•",
+        text: `Wait for the host — the "host offline" badge above means their app isn't reachable right now`,
+        cls: "wait",
+      });
+    } else if (status.pending) {
+      guideSteps.push({
+        icon: "→",
+        text: `Press "Apply update" above — downloads "${status.pending.packName || packName}" v${status.pending.version}`,
+        cls: "now",
+      });
+    } else if (status.appliedVersion > 0) {
+      guideSteps.push({
+        icon: "✓",
+        text: `Modpack downloaded — you're on v${status.appliedVersion}`,
+        cls: "done",
+      });
+    } else if (status.latestVersion > 0) {
+      // published but not offered — the member declined this version (or
+      // a targeted push went to someone else); nothing to click here.
+      guideSteps.push({
+        icon: "•",
+        text: `v${status.latestVersion} exists but isn't offered to you — you may have declined it; ask the host to re-push or wait for the next update`,
+        cls: "wait",
+      });
+    } else {
+      guideSteps.push({
+        icon: "•",
+        text: `No pack published yet — ask the host to press "Publish update…" on their side`,
+        cls: "wait",
+      });
+    }
+    if (installedIn) {
+      guideSteps.push({
+        icon: "✓",
+        text: `Installed into ${installedIn}`,
+        cls: "done",
+      });
+    } else if (status.appliedVersion > 0 && launchers.length === 0) {
+      guideSteps.push({
+        icon: "•",
+        text: `No launcher detected — install TLauncher or Prism first (the list below re-scans automatically)`,
+        cls: "wait",
+      });
+    } else if (status.appliedVersion > 0) {
+      guideSteps.push({
+        icon: "→",
+        text: `Install it — pick your launcher under "Load into Minecraft" below (a popup also appears right after a download)`,
+        cls: "now",
+      });
+    } else {
+      guideSteps.push({
+        icon: "•",
+        text: "Install into your launcher — this step unlocks after the download",
+        cls: "wait",
+      });
+    }
+    guideSteps.push(
+      installedIn
+        ? {
+            icon: "→",
+            text: `Play — open ${installedIn} and run "${packName}"`,
+            cls: "now",
+          }
+        : { icon: "•", text: "Open your launcher and play", cls: "wait" }
+    );
     return (
       <div className="view">
         <div className="panel">
@@ -814,11 +926,26 @@ export default function ConnectView(_props: Props) {
             {status.networkName}{" "}
             <span className={`badge ${status.hostOnline ? "ok" : "err"}`}>
               host {status.hostOnline ? "online" : "offline"}
-            </span>
+            </span>{" "}
+            <button
+              className="guide-btn"
+              title="How does this work?"
+              onClick={() => {
+                uiLog("ui", "guide open (joined)");
+                setGuideOpen(true);
+              }}
+            >
+              ?
+            </button>
           </h3>
           <div className="dim" style={{ marginBottom: 10 }}>
             {status.hostAddr} · you're <b>{status.displayName}</b> · applied: v{status.appliedVersion}
           </div>
+          {installedIn && (
+            <div className="banner ok" style={{ marginBottom: 10 }}>
+              ✓ Installed to {installedIn} — open it and run "{packName}"
+            </div>
+          )}
           {status.pending ? (
             <div className="banner info">
               <div>
@@ -933,6 +1060,7 @@ export default function ConnectView(_props: Props) {
                     onClick={() => loadSyncedInto(l)}
                   >
                     {l.name}
+                    {installedIn === l.name ? " ✓" : ""}
                   </button>
                 ))}
               </>
@@ -978,6 +1106,7 @@ export default function ConnectView(_props: Props) {
                         }}
                       >
                         {l.name}
+                        {installedIn === l.name ? " ✓" : ""}
                       </button>
                     ))}
                   </div>
@@ -985,6 +1114,27 @@ export default function ConnectView(_props: Props) {
               )}
               <div className="upd-actions">
                 <button onClick={() => setPickerOpen(false)}>Later</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {guideOpen && (
+          <div className="upd-overlay" onClick={() => setGuideOpen(false)}>
+            <div className="upd-card" onClick={(e) => e.stopPropagation()}>
+              <h3>Getting your modpack — step by step</h3>
+              {guideSteps.map((s, i) => (
+                <div key={i} className={`guide-row ${s.cls}`}>
+                  <span className="guide-ico">{s.icon}</span>
+                  <span>{s.text}</span>
+                </div>
+              ))}
+              <p className="dim" style={{ marginTop: 10 }}>
+                When the host publishes something new, "Apply update" appears
+                again — click it and you're current. The app keeps running
+                in the tray, so closing the window doesn't stop updates.
+              </p>
+              <div className="upd-actions">
+                <button onClick={() => setGuideOpen(false)}>Close</button>
               </div>
             </div>
           </div>
@@ -1038,7 +1188,11 @@ export default function ConnectView(_props: Props) {
         <h3>Found networks</h3>
         {found.length === 0 && <div className="dim">Scanning the LAN…</div>}
         {found.map((n) => (
-          <div className="launcher-card" key={n.networkId}>
+          <div
+            className="launcher-card"
+            key={n.networkId}
+            style={{ opacity: n.live ? 1 : 0.55 }}
+          >
             <div style={{ fontSize: "1.4rem" }}>⇄</div>
             <div className="grow">
               <div className="name">
@@ -1049,11 +1203,13 @@ export default function ConnectView(_props: Props) {
                     : n.requiresCode === true
                       ? "locked"
                       : "locked?"}
-                </span>
+                </span>{" "}
+                {!n.live && <span className="badge miss">offline</span>}
               </div>
               <div className="sub">
                 {n.machine} · pack "{n.packName}" ·{" "}
                 {n.latestVersion === 0 ? "not published yet" : `v${n.latestVersion}`} · {n.members} member(s)
+                {!n.live && ` · last seen ${ago(n.lastSeen)}`}
               </div>
             </div>
             <button

@@ -64,7 +64,7 @@ Loading a pack never starts Minecraft or opens the launcher — it stages everyt
 ## Tabs
 
 ### Loader
-The default tab. Drop in a `.mrpack` or `.zip` pack (or a folder) and install it into any detected launcher. Works completely standalone — no mod scan required. Duplicate instance names get an explicit overwrite prompt.
+Drop in a `.mrpack` or `.zip` pack (or a folder) and install it into any detected launcher. Works completely standalone — no mod scan required. Duplicate instance names get an explicit overwrite prompt.
 
 ### Mods
 Scan a mods folder recursively and add individually-picked jars in the same list — deduplicated by path. Select, exclude, remove, or clear; inspect jar metadata; resolve names/versions via Modrinth. Scanning runs in parallel so big folders don't freeze the UI.
@@ -80,10 +80,13 @@ Turn the selected mods into a pack:
 | `modlist.txt` | Simple list of what's inside |
 
 ### Connect
-LAN/Radmin VPN modpack synchronization.
+The default tab — LAN/Radmin VPN modpack synchronization.
 
 - **Host shares a living folder** of `.jar` files — add or remove mods in the folder anytime, then push changes
 - **Strict manual publish** — nothing is ever shared automatically. Mods only go out when *you* press publish. No auto-publish whatsoever.
+- **Instant discovery** — members broadcast a `MMPKQ` "who's there?" query on open/refresh/unhide; hosts answer immediately with a unicast announce (works across VPN adapters that eat broadcasts)
+- **Remembered networks** — found networks persist across restarts and resurface dimmed with a "last seen" time until the host answers again
+- **Built-in member guide** — the `?` button in a joined network walks members through apply → pick launcher → play, adapting to what's already done
 - **Join codes** — require a code to join, or run an open network; network name and code are editable live
 - **Targeted publish** — send to everyone or a single member/IP
 - **Host controls membership** — only the host can kick; kicked members can rejoin with the code (kick ≠ ban)
@@ -181,7 +184,7 @@ The script signs the manifest with the key at `%LOCALAPPDATA%\modpack-manager\up
 | Shell | Tauri v2 (Windows, custom title bar, small utility window) |
 | Frontend | React 19 + TypeScript + Vite — monochrome dark UI |
 | Backend | Rust — `tiny_http` LAN server, `reqwest` downloads, `minisign-verify` signatures, `rayon` parallel scanning, `zip`, `socket2` UDP discovery |
-| Ports | `47676/tcp` HTTP (lazy-bound) · `47677/udp` discovery (`MMPK1` / `MMPKAPP`) |
+| Ports | `47676/tcp` HTTP (lazy-bound) · `47677/udp` discovery (`MMPK1` / `MMPKQ` / `MMPKAPP`) |
 
 ### Project layout
 

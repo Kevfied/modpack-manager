@@ -95,12 +95,14 @@ Requirements: you must be on the **same network** — same house LAN, or connect
 ### Joining a friend's network (the usual case)
 
 1. Make sure your friend is hosting (see below) and you're on the same LAN/Radmin.
-2. Open **Connect**. It scans the LAN automatically — their network appears under **"Found networks"** within a few seconds.
+2. The app opens on **Connect**. It actively asks the LAN for networks — their network appears under **"Found networks"** almost instantly (a dimmed *offline* entry means the app saw them before but they're not answering right now — it lights up the moment they host again).
    - Nothing showing up? Type their IP into the *"…or host IP"* box manually (e.g. `26.12.34.56` for Radmin).
 3. Click **Join** on their network.
 4. Enter **your display name** and the **join code** if they set one.
-5. You're in. When the host publishes, you'll see a pending update — click **Apply** and the new/changed mods land in your synced folder. Only the differences download.
-6. Then load the pack from the **Loader** tab (*"Synced packs (from Connect)"*).
+5. You're in. When the host publishes, you'll see a pending update — click **Apply update** and the new/changed mods land in your synced folder. Only the differences download.
+6. A launcher picker pops up when the download finishes — pick the launcher you play Minecraft with. Done: open that launcher and run the pack.
+
+**Lost? Press the `?` button** next to the network name while you're in a network — it shows the exact next step for wherever you are (no pack yet → "ask the host to publish", downloaded → "pick your launcher", installed → "open it and play").
 
 While joined you can:
 - **Check for updates** — refresh manually if you're impatient
@@ -108,6 +110,8 @@ While joined you can:
 - **Leave network** anytime
 
 > If the host kicks you, you're removed immediately — but you can rejoin with the join code whenever. It's not a ban.
+>
+> Closing the window just hides the app to the tray — it keeps syncing in the background. Real quit is in the tray menu.
 
 ### Hosting a network (one person does this)
 

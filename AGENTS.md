@@ -12,7 +12,10 @@ Tauri v2 desktop app — Rust backend (`src-tauri`), React+TS frontend (`src`), 
 
 ## Connect (LAN modpack sync)
 
-`src-tauri/src/sync.rs`. HTTP on 47676, UDP discovery on 47677 (`MMPK1`).
+`src-tauri/src/sync.rs`. HTTP on 47676, UDP discovery on 47677 (`MMPK1`
+announce, `MMPKQ` member query → host replies with instant unicast announce,
+`MMPKAPP` update-seed announce). Found networks persist in `connect.json`
+(`Store.found`) and resurface as stale entries (`live: false`, 14-day TTL).
 Strict rule: nothing is published/applied without an explicit user action.
 
 ## App updates (LAN, standalone — not Connect)
@@ -35,6 +38,6 @@ Strict rule: nothing is published/applied without an explicit user action.
 ## Conventions
 
 - Monochrome dark UI, sharp edges, monospace; tab order Loader | Mods | Build
-  | Connect (Loader default).
+  | Connect (Connect default — members live there).
 - Async Tauri commands; no std MutexGuard held across `.await`.
 - HTTP handlers are spawned per-request — never block them.

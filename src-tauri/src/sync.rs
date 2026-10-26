@@ -26,6 +26,8 @@ const ONLINE_WINDOW_SECS: u64 = 135;
 const OFFLINE_MISSES: u32 = 3;
 /// How long a found network stays listed after its announces stop.
 const FOUND_TTL_SECS: u64 = 45;
+/// A *stale* (remembered, not announcing) found entry survives this long.
+const STALE_TTL_SECS: u64 = 14 * 24 * 3600;
 /// Per-file GET ceiling — generous because per-chunk stall timeouts and
 /// retry/resume handle real stalls; this only bounds a dead connection.
 const FILE_TIMEOUT_SECS: u64 = 3600;
@@ -41,6 +43,16 @@ const EMIT_MS: u128 = 120;
 /// slow down (never stop) so hosting/presence survive efficiency mode.
 pub static APP_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+/// Wakes member heartbeat loops early — a returning user shouldn't wait
+/// out the 60s hidden-mode sleep. `watch` (not Notify) because several
+/// loops share the signal: receivers always observe the latest generation,
+/// even loops that were mid-request when it fired.
+static HB_WAKE_GEN: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+
+fn hb_wake_gen() -> &'static tokio::sync::watch::Sender<u64> {
+    HB_WAKE_GEN.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
 /// Set by the cancel command — the apply engine checks it between chunks.
 static APPLY_CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -52,6 +64,17 @@ pub fn set_hidden(hidden: bool) {
             if hidden { "hidden" } else { "shown" },
             if hidden { "slowed" } else { "normal" }
         );
+        if !hidden {
+            // Bump the generation — every heartbeat loop observes it on
+            // its next wait (or gets its current wait cut short).
+            hb_wake_gen().send_modify(|g| *g += 1);
+            // Burst: members refresh presence/discovery and a host announces
+            // immediately instead of waiting out the slowed hidden tick.
+            std::thread::spawn(|| {
+                query_networks();
+                announce_now();
+            });
+        }
     }
 }
 
@@ -119,7 +142,7 @@ pub struct Member {
     pub app_version: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoundNetwork {
     #[serde(rename = "networkId")]
     pub network_id: String,
@@ -132,16 +155,20 @@ pub struct FoundNetwork {
     pub latest_version: u64,
     pub members: usize,
     /// The host's app version (display only).
-    #[serde(rename = "appVersion")]
+    #[serde(rename = "appVersion", default)]
     pub app_version: String,
     /// Whether the network requires a join code. `None` = the announce
     /// didn't carry the field (host older than 0.1.9) → treat as unknown.
-    #[serde(rename = "requiresCode", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "requiresCode", skip_serializing_if = "Option::is_none", default)]
     pub requires_code: Option<bool>,
-    /// When the last announce for this network arrived — entries silent
-    /// past TTL are dropped from the found list.
-    #[serde(skip_serializing)]
+    /// When the last announce for this network arrived. Live entries silent
+    /// past TTL are dropped; stale ones persist for "last seen" display.
+    #[serde(rename = "lastSeen", default)]
     pub last_seen: u64,
+    /// `true` while announces keep refreshing this entry; `false` = a
+    /// remembered entry from the store — shown dimmed until re-confirmed.
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +191,8 @@ pub struct MemberView {
 #[derive(Debug, Serialize)]
 pub struct PendingUpdate {
     pub version: u64,
+    #[serde(rename = "packName")]
+    pub pack_name: String,
     pub note: String,
     #[serde(rename = "fileCount")]
     pub file_count: usize,
@@ -299,6 +328,10 @@ pub type SharedClient = Arc<Mutex<Option<ClientState>>>;
 pub struct Store {
     pub host: Option<SavedHost>,
     pub client: Option<SavedClient>,
+    /// Remembered discovered networks — seeded on start so the found list
+    /// isn't empty while queries are in flight. They come back stale.
+    #[serde(default)]
+    pub found: Vec<FoundNetwork>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +393,18 @@ pub fn store_path() -> PathBuf {
         .join("connect.json")
 }
 
+/// The discovery-listener thread saves found entries on its own — it needs
+/// a store path without a parameter. Sandboxes override it to a temp dir.
+static STORE_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_store_path_override(p: PathBuf) {
+    let _ = STORE_PATH_OVERRIDE.set(p);
+}
+
+fn effective_store_path() -> PathBuf {
+    STORE_PATH_OVERRIDE.get().cloned().unwrap_or_else(store_path)
+}
+
 fn load_store(path: &Path) -> Store {
     std::fs::read_to_string(path)
         .ok()
@@ -374,53 +419,61 @@ fn save_store(path: &Path, store: &Store) {
     let _ = std::fs::write(path, serde_json::to_string_pretty(store).unwrap_or_default());
 }
 
+/// Every load+modify+save MUST hold this — a writer working off a stale
+/// snapshot clobbers concurrent updates (the discovery listener's
+/// `save_found` once dropped a roster row written mid-flight).
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn update_store(path: &Path, f: impl FnOnce(&mut Store)) {
+    let _g = STORE_LOCK.lock().unwrap();
+    let mut store = load_store(path);
+    f(&mut store);
+    save_store(path, &store);
+}
+
 fn save_host(store_path: &Path, h: &HostState) {
-    let mut store = load_store(store_path);
-    store.host = Some(SavedHost {
-        name: h.name.clone(),
-        code: h.code.clone(),
-        folder: h.folder.to_string_lossy().into_owned(),
-        network_id: h.network_id.clone(),
-        pack_name: h.pack_name.clone(),
-        pack_version: h.pack_version.clone(),
-        mc_version: h.mc_version.clone(),
-        loader: h.loader.clone(),
-        loader_version: h.loader_version.clone(),
-        meta_folder: h.meta_folder.clone(),
-        manifest: Some(h.manifest.clone()),
-        counter: h.counter,
-        history: h.history.clone(),
-        banned: h.banned.iter().copied().collect(),
-        members: h.members.values().cloned().collect(),
+    update_store(store_path, |store| {
+        store.host = Some(SavedHost {
+            name: h.name.clone(),
+            code: h.code.clone(),
+            folder: h.folder.to_string_lossy().into_owned(),
+            network_id: h.network_id.clone(),
+            pack_name: h.pack_name.clone(),
+            pack_version: h.pack_version.clone(),
+            mc_version: h.mc_version.clone(),
+            loader: h.loader.clone(),
+            loader_version: h.loader_version.clone(),
+            meta_folder: h.meta_folder.clone(),
+            manifest: Some(h.manifest.clone()),
+            counter: h.counter,
+            history: h.history.clone(),
+            banned: h.banned.iter().copied().collect(),
+            members: h.members.values().cloned().collect(),
+        });
     });
-    save_store(store_path, &store);
 }
 
 fn save_client(store_path: &Path, c: &ClientState) {
-    let mut store = load_store(store_path);
-    store.client = Some(SavedClient {
-        network_id: c.network_id.clone(),
-        network_name: c.network_name.clone(),
-        host_addr: c.host_addr.clone(),
-        code: c.code.clone(),
-        member_id: c.member_id,
-        display_name: c.display_name.clone(),
-        applied_version: c.applied_version,
-        declined: c.declined.clone(),
+    update_store(store_path, |store| {
+        store.client = Some(SavedClient {
+            network_id: c.network_id.clone(),
+            network_name: c.network_name.clone(),
+            host_addr: c.host_addr.clone(),
+            code: c.code.clone(),
+            member_id: c.member_id,
+            display_name: c.display_name.clone(),
+            applied_version: c.applied_version,
+            declined: c.declined.clone(),
+        });
     });
-    save_store(store_path, &store);
 }
 
 fn clear_saved_host(store_path: &Path) {
-    let mut store = load_store(store_path);
-    store.host = None;
-    save_store(store_path, &store);
+    update_store(store_path, |store| store.host = None);
 }
 
 fn clear_saved_client(store_path: &Path) {
-    let mut store = load_store(store_path);
-    store.client = None;
-    save_store(store_path, &store);
+    update_store(store_path, |store| store.client = None);
 }
 
 // ------------------------------------------------------- manifest
@@ -559,6 +612,7 @@ pub fn host_start(
     loader: &str,
     loader_version: &str,
 ) -> Result<String> {
+    set_query_host(hs);
     host_stop(hs, store_path);
     let folder_path = PathBuf::from(folder);
     if !folder_path.is_dir() {
@@ -1418,6 +1472,87 @@ pub fn broadcast_targets() -> Vec<Ipv4Addr> {
     out
 }
 
+/// The announce payload — built once, used by the announce loop and by
+/// the instant query reply (`MMPKQ`).
+fn announce_msg(h: &HostState) -> String {
+    serde_json::json!({
+        "magic": "MMPK1",
+        "networkId": h.network_id,
+        "name": h.name,
+        "packName": h.pack_name,
+        "machine": machine_name(),
+        "port": HTTP_PORT,
+        "latestVersion": h.manifest.version,
+        "members": h.members.len(),
+        "requiresCode": !h.code.is_empty(),
+        "appVersion": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string()
+}
+
+/// The query responder needs the live HostState but `start_discovery_listener`
+/// is a static once-per-process thread — hand it the shared cell once.
+static QUERY_HOST: OnceLock<SharedHost> = OnceLock::new();
+
+pub fn set_query_host(hs: &SharedHost) {
+    let _ = QUERY_HOST.set(hs.clone());
+}
+
+/// A member broadcast `MMPKQ` ("who's there?") — answer instantly with a
+/// unicast announce straight back to them. Discovery used to depend on the
+/// next periodic announce (up to 15s while trayed); queries make it <1s.
+/// Replies go to the asker's own listen port (47677) — directed unicast
+/// also survives VPN adapters that eat broadcasts.
+fn answer_query(src: std::net::SocketAddr) {
+    let Some(hs) = QUERY_HOST.get() else { return };
+    let msg = {
+        let g = hs.lock().unwrap();
+        g.as_ref().map(announce_msg)
+    };
+    let Some(msg) = msg else { return };
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.set_broadcast(true);
+        let _ = sock.send_to(msg.as_bytes(), (src.ip(), BROADCAST_PORT));
+    }
+}
+
+/// Ask every reachable LAN segment who is hosting. Throttled — callers
+/// (status polls, mount, unhide, manual refresh) can call freely.
+pub fn query_networks() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut g = LAST.lock().unwrap();
+        if g.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false) {
+            return;
+        }
+        *g = Some(std::time::Instant::now());
+    }
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.set_broadcast(true);
+        let msg = br#"{"magic":"MMPKQ"}"#;
+        for b in broadcast_targets() {
+            let _ = sock.send_to(msg, (b, BROADCAST_PORT));
+        }
+    }
+}
+
+/// Broadcast one announce right now — used when the window un-hides so
+/// peers don't wait for the slowed hidden-mode tick.
+pub fn announce_now() {
+    let Some(hs) = QUERY_HOST.get() else { return };
+    let msg = {
+        let g = hs.lock().unwrap();
+        g.as_ref().map(announce_msg)
+    };
+    let Some(msg) = msg else { return };
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.set_broadcast(true);
+        for b in broadcast_targets() {
+            let _ = sock.send_to(msg.as_bytes(), (b, BROADCAST_PORT));
+        }
+    }
+}
+
 /// `stop` is captured from THIS host instance — a task from a previous
 /// hosting session must die even if `hs` already holds a new HostState
 /// (a quick stop→start would otherwise leave two announcers running).
@@ -1444,19 +1579,7 @@ fn announce_loop(hs: SharedHost, stop: Arc<AtomicBool>) {
         }
         let g = hs.lock().unwrap();
         let Some(h) = g.as_ref() else { return };
-        let msg = serde_json::json!({
-            "magic": "MMPK1",
-            "networkId": h.network_id,
-            "name": h.name,
-            "packName": h.pack_name,
-            "machine": machine_name(),
-            "port": HTTP_PORT,
-            "latestVersion": h.manifest.version,
-            "members": h.members.len(),
-            "requiresCode": !h.code.is_empty(),
-            "appVersion": env!("CARGO_PKG_VERSION"),
-        })
-        .to_string();
+        let msg = announce_msg(h);
         drop(g);
         for b in broadcast_targets() {
             let _ = sock.send_to(msg.as_bytes(), (b, BROADCAST_PORT));
@@ -1519,6 +1642,8 @@ pub fn start_discovery_listener() {
             match v["magic"].as_str() {
                 Some("MMPKAPP") => crate::appupdate::note_seeder_announce(&v, src.ip()),
                 Some("MMPK1") => {}
+                // "who's there?" — a host answers instantly; members ignore.
+                Some("MMPKQ") => answer_query(src),
                 _ => continue,
             }
             if v["magic"].as_str() != Some("MMPK1") {
@@ -1536,12 +1661,15 @@ pub fn start_discovery_listener() {
                 app_version: v["appVersion"].as_str().unwrap_or("").to_string(),
                 requires_code: v["requiresCode"].as_bool(),
                 last_seen: now_secs(),
+                live: true,
             };
             if !f.network_id.is_empty() {
                 let mut m = found_map().lock().unwrap();
+                // A live announce revives a stale remembered entry too.
                 let changed = match m.get(&f.network_id) {
                     Some(o) => {
-                        o.latest_version != f.latest_version
+                        !o.live
+                            || o.latest_version != f.latest_version
                             || o.addr != f.addr
                             || o.name != f.name
                             || o.members != f.members
@@ -1551,6 +1679,7 @@ pub fn start_discovery_listener() {
                 m.insert(f.network_id.clone(), f);
                 drop(m);
                 if changed {
+                    save_found();
                     if let Some(h) = FOUND_HOOK.get() {
                         h();
                     }
@@ -1560,14 +1689,56 @@ pub fn start_discovery_listener() {
     });
 }
 
-pub fn found_networks() -> Vec<FoundNetwork> {
-    start_discovery_listener();
+/// Load remembered networks from the store once — they come back stale
+/// (`live: false`) so the found list isn't empty on a cold start while
+/// the first query answers are still in flight.
+fn seed_found_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let store = load_store(&effective_store_path());
+    seed_found(store.found);
+}
+
+/// Seed stale entries into the found map — public for the sandbox.
+#[doc(hidden)]
+pub fn seed_found(found: Vec<FoundNetwork>) {
     let now = now_secs();
     let mut m = found_map().lock().unwrap();
-    // Dead hosts stop announcing — their entries must die too, or the
-    // found list fills with networks that will never answer a join.
+    for mut f in found {
+        f.live = false;
+        if now.saturating_sub(f.last_seen) <= STALE_TTL_SECS {
+            m.entry(f.network_id.clone()).or_insert(f);
+        }
+    }
+}
+
+/// Snapshot the found map into the store — called from the listener when
+/// an announce reveals something new or a stale entry gets re-confirmed.
+fn save_found() {
+    let found: Vec<FoundNetwork> = found_map().lock().unwrap().values().cloned().collect();
+    if found.is_empty() {
+        return;
+    }
+    update_store(&effective_store_path(), |store| store.found = found);
+}
+
+pub fn found_networks() -> Vec<FoundNetwork> {
+    start_discovery_listener();
+    seed_found_once();
+    // Every lookup also pings the LAN — throttled inside query_networks.
+    query_networks();
+    let now = now_secs();
+    let mut m = found_map().lock().unwrap();
+    // Live entries die when their announces stop; stale remembered entries
+    // get a much longer leash — "last seen" beats "gone" for a host that's
+    // just temporarily down.
     let before = m.len();
-    m.retain(|_, f| now.saturating_sub(f.last_seen) <= FOUND_TTL_SECS);
+    m.retain(|_, f| {
+        let ttl = if f.live { FOUND_TTL_SECS } else { STALE_TTL_SECS };
+        now.saturating_sub(f.last_seen) <= ttl
+    });
     if m.len() != before {
         crate::alog!("net", "dropped {} stale found entr(ies)", before - m.len());
     }
@@ -1581,6 +1752,12 @@ pub fn found_networks() -> Vec<FoundNetwork> {
 #[doc(hidden)]
 pub fn found_insert_for_test(f: FoundNetwork) {
     found_map().lock().unwrap().insert(f.network_id.clone(), f);
+}
+
+/// Sandbox hook — empty the found map.
+#[doc(hidden)]
+pub fn found_clear_for_test() {
+    found_map().lock().unwrap().clear();
 }
 
 /// Re-resolve a joined host's address from the latest announce (IP may change).
@@ -1783,6 +1960,7 @@ fn spawn_heartbeat(cs: SharedClient) {
         .unwrap_or(0);
     tokio::spawn(async move {
         let http = reqwest::Client::new();
+        let mut wake_rx = hb_wake_gen().subscribe();
         loop {
             let (addr, code, mid, name, applied, nid) = {
                 let g = cs.lock().unwrap();
@@ -1840,13 +2018,16 @@ fn spawn_heartbeat(cs: SharedClient) {
                 }
             }
             // Presence must survive efficiency mode — slowed, not stopped.
-            tokio::time::sleep(Duration::from_secs(
-                if APP_HIDDEN.load(Ordering::Relaxed) {
+            // A wake-gen bump (window shown) ends the wait early so the
+            // member reappears online immediately instead of up to 60s later.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(if APP_HIDDEN.load(Ordering::Relaxed) {
                     60
                 } else {
                     HEARTBEAT_SECS
-                },
-            ))
+                }),
+                wake_rx.changed(),
+            )
             .await;
         }
     });
@@ -2804,6 +2985,7 @@ pub async fn connect_status(
                 .flatten()
                 .map(|(m, dl, del)| PendingUpdate {
                     version: m.version,
+                    pack_name: m.pack_name.clone(),
                     note: m.note.clone(),
                     file_count: m.files.len(),
                     to_download: dl,
@@ -2828,13 +3010,27 @@ pub async fn connect_status(
         let g = cs.lock().unwrap();
         let c = g.as_ref().unwrap();
         let members: Vec<MemberView> = c.member_views.clone();
+        // Pack name for display/guide text: the applied pack.json is the
+        // truth post-install; before that, the host's announce says it.
+        let pack_name = std::fs::read_to_string(c.synced_dir.join("pack.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["name"].as_str().map(|x| x.to_string()))
+            .or_else(|| {
+                found_map()
+                    .lock()
+                    .unwrap()
+                    .get(&c.network_id)
+                    .map(|f| f.pack_name.clone())
+            })
+            .filter(|s| !s.is_empty());
         return Ok(ConnectStatus {
             mode: "joined".into(),
             network_name: Some(c.network_name.clone()),
             network_id: Some(c.network_id.clone()),
             code: None,
             folder: None,
-            pack_name: None,
+            pack_name,
             pack_version: None,
             mc_version: None,
             loader: None,
@@ -2889,6 +3085,7 @@ pub fn resume(
     store_path: &Path,
     synced_root: &Path,
 ) {
+    set_query_host(hs);
     let store = load_store(store_path);
     if let Some(h) = store.host {
         let _ = host_resume(hs, store_path, &h);

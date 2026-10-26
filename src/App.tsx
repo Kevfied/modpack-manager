@@ -38,7 +38,7 @@ import ConnectView from "./views/ConnectView";
 type View = "loader" | "mods" | "build" | "connect";
 
 export default function App() {
-  const [view, setView] = useState<View>("loader");
+  const [view, setView] = useState<View>("connect");
   const [folder, setFolder] = useState<string | null>(null);
   const [mods, setMods] = useState<ModInfo[]>([]);
   const [resolved, setResolved] = useState<Record<string, ResolvedMod>>({});

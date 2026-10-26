@@ -277,6 +277,9 @@ fn main() {
     let mc_dir = base.join(".minecraft");
     let prism_dir = base.join("prism-data");
     std::fs::create_dir_all(&mc_dir).unwrap();
+    // The discovery listener persists found entries on its own — without
+    // this override it would write into the REAL connect.json.
+    sync::set_store_path_override(store_path.clone());
 
     let hs: sync::SharedHost = Arc::new(Mutex::new(None));
     let cs: sync::SharedClient = Arc::new(Mutex::new(None));
@@ -1307,6 +1310,7 @@ fn main() {
             app_version: "0".into(),
             requires_code: Some(true),
             last_seen: 1, // ancient — must be pruned on read
+            live: true,   // live entries die fast; stale ones get 14d
         });
         check(
             sync::found_networks()
@@ -1331,6 +1335,81 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         check(found_ours, "our announce is discoverable on the LAN");
+
+        // ---- 9p. instant discovery (MMPKQ) + found persistence ----
+        println!("== instant discovery / found persistence ==");
+        // Wait out the query throttle so the next found_networks() call
+        // fires MMPKQ for sure, then hide: a trayed host announces only
+        // every 15s, so a fast reappearance can only be the query reply.
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+        sync::set_hidden(true);
+        sync::found_clear_for_test();
+        let mut found_live = false;
+        for _ in 0..12 {
+            // found_networks() fires the throttled MMPKQ itself.
+            if let Some(f) = sync::found_networks()
+                .iter()
+                .find(|f| f.name == "sandbox-net-v2")
+            {
+                check(f.live, "query answer produced a live found entry");
+                found_live = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        check(
+            found_live,
+            "MMPKQ instant discovery (entry back in <3s, not a 15s announce wait)",
+        );
+        sync::set_hidden(false);
+
+        // Remembered networks come back stale instead of vanishing —
+        // "last seen" beats "gone" for a temporarily-offline host.
+        sync::found_insert_for_test(sync::FoundNetwork {
+            network_id: "remembered".into(),
+            name: "old-net".into(),
+            pack_name: "p".into(),
+            machine: "m".into(),
+            addr: "10.1.1.1:47676".into(),
+            latest_version: 3,
+            members: 2,
+            app_version: "0".into(),
+            requires_code: None,
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 3600,
+            live: false,
+        });
+        check(
+            sync::found_networks()
+                .iter()
+                .any(|f| f.network_id == "remembered" && !f.live),
+            "remembered (stale) network survives with live=false",
+        );
+
+        // The listener persisted the live entry into the store on change.
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
+        check(
+            store["found"]
+                .as_array()
+                .map(|a| a.iter().any(|f| f["name"] == "sandbox-net-v2"))
+                .unwrap_or(false),
+            "found entries persisted into connect.json",
+        );
+        // Reseeding the store brings them back stale, not live.
+        sync::found_clear_for_test();
+        sync::seed_found(serde_json::from_value(store["found"].clone()).unwrap());
+        check(
+            sync::found_networks()
+                .iter()
+                .any(|f| f.name == "sandbox-net-v2" && !f.live),
+            "store reseed restores networks as stale",
+        );
+        sync::found_clear_for_test();
+
         // alice is now on a fresh id from the network-switch rejoin —
         // re-save her session so resume restores her, not a stale slot.
         sync::apply_update(&cs, &http, &store_path).await.unwrap();
@@ -1449,6 +1528,73 @@ fn main() {
         );
         let _ = vanilla; // vanilla path needs a real .minecraft — covered by packtest
     });
+
+    // ---- 11c. heartbeat wakes on unhide ----
+    println!("== heartbeat wake on unhide ==");
+    {
+        // Max over same-named rows — a dropped+reinserted member can
+        // briefly exist twice; only the live row's beats matter.
+        let last_seen_of = |name: &str| -> u64 {
+            hs.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .members
+                .values()
+                .filter(|m| m.name == name)
+                .map(|m| m.last_seen)
+                .max()
+                .unwrap_or(0)
+        };
+        check(
+            last_seen_of("alice") > 0,
+            "member heartbeats landing before the test",
+        );
+        // First confirm the loop is actually beating — hidden-mode tests
+        // are meaningless if her loop already died upstream.
+        let pre = last_seen_of("alice");
+        let mut alive = false;
+        for _ in 0..32 {
+            if last_seen_of("alice") > pre {
+                alive = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let cstate = cs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| {
+                format!(
+                    "kicked={} host_online={} mid={} addr={} nid={}",
+                    c.kicked, c.host_online, c.member_id, c.host_addr, c.network_id
+                )
+            })
+            .unwrap_or_else(|| "no session".into());
+        check(alive, &format!("alice heartbeat loop beating while visible [{cstate}]"));
+        // Hidden mode sleeps the heartbeat 60s. Wait out any in-flight
+        // 15s visible-mode sleep (plus margin so last_seen is strictly
+        // older than the wake beat) — the only possible next beat is the
+        // unhide wakeup; nothing natural can fire for ~43s.
+        sync::set_hidden(true);
+        std::thread::sleep(std::time::Duration::from_secs(17));
+        let t1 = last_seen_of("alice");
+        sync::set_hidden(false);
+        let mut woke = false;
+        for _ in 0..10 {
+            if last_seen_of("alice") > t1 {
+                woke = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        check(
+            woke,
+            "unhide woke the heartbeat — member online again in <4s, not 60s",
+        );
+        sync::set_hidden(false);
+    }
 
     // ---- 12. host offline ----
     println!("== host offline ==");

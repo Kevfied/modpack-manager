@@ -288,6 +288,31 @@ td.dim, .dim { color: var(--text-dim); }
 .upd-warn { color: var(--text); font-weight: 700; font-size: 0.8rem; }
 .upd-actions { display: flex; gap: 8px; margin-top: 12px; }
 
+/* ---- member guide ("?" button + step list) ---- */
+.guide-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  vertical-align: middle;
+}
+.guide-btn:hover { color: var(--text); }
+.guide-row {
+  display: flex;
+  gap: 9px;
+  margin: 7px 0;
+  font-size: 0.82rem;
+  align-items: flex-start;
+}
+.guide-ico { width: 14px; text-align: center; flex-shrink: 0; }
+.guide-row.wait { color: var(--text-dim); }
+.guide-row.now { color: var(--text); font-weight: 700; }
+.guide-row.done { color: var(--text-dim); }
+.guide-row.done .guide-ico { color: var(--text); }
+
 /* ---- connect apply progress + gear menu ---- */
 .file-row {
   display: flex;

@@ -177,6 +177,10 @@ export interface FoundNetwork {
   appVersion: string; // the host's running app version (display only)
   /** undefined = announce didn't say (host older than 0.1.9) — ask for code. */
   requiresCode?: boolean;
+  /** true = announcing right now; false = remembered from a past session. */
+  live: boolean;
+  /** Epoch seconds of the last announce — for "last seen" display. */
+  lastSeen: number;
 }
 
 export interface MemberView {
@@ -192,6 +196,7 @@ export interface MemberView {
 
 export interface PendingUpdate {
   version: number;
+  packName: string;
   note: string;
   fileCount: number;
   toDownload: number;
