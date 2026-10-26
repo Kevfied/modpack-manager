@@ -102,7 +102,7 @@ member:  discover ──join──▶ fetch manifest ──diff──▶ downloa
 The app updates itself peer-to-peer — independent of Connect networks and join codes. One command publishes; every running copy on the LAN finds it.
 
 - **Signed manifests** — the publisher signs `latest.json` with a minisign key; every client verifies version, channel, architecture, and payload SHA-256 *before* offering anything
-- **Explicit everywhere** — building an exe advertises nothing; installing an update always needs a click. Two "are you sure" gates, by design
+- **Explicit everywhere** — building an exe advertises nothing; installing an update always needs a click. One confirm gates the whole chain: download → restart → install all fire from it
 - **Gossip-style reseeding** — after a peer verifies a download, it becomes a seeder too. Alice gets v1.4, the dev goes offline, Bob arrives later and downloads it *from Alice*
 - **Resilient downloads** — `.part` staging, HTTP Range resume, failover across up to 3 seeders, free-space preflight, atomic rename only after verification
 - **Can't be poisoned** — forged manifests, wrong keys, downgrades, replayed versions, and unsafe filenames are all rejected; the signature is the trust, not the sender
@@ -221,7 +221,7 @@ No. It installs packs into launchers and stages everything — starting the game
 No — just the installer from Releases.
 
 **Can updates install without me clicking?**
-No. Peers can auto-*discover*, auto-*download*, and auto-*verify* — but installing always requires an explicit "Restart & install". Same for publishing: nothing goes out without the publish confirmation.
+No. Peers can auto-*discover*, auto-*download*, and auto-*verify* — but installing always starts from an explicit click. "Update now" asks once ("the app downloads, closes, installs, and reopens itself"), then the whole chain runs on its own. Same for publishing: nothing goes out without the publish confirmation.
 
 **What if the update server/host goes offline mid-download?**
 The download resumes from the `.part` file against another seeder — up to 3 are tracked. If every seeder vanishes, the app shows "waiting for a seeder" and picks up where it left off the moment anyone re-announces.

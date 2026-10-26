@@ -103,6 +103,10 @@ export default function App() {
   // results — an in-flight poll from before the click would otherwise
   // snap the bar back to "Update now" until the next tick.
   const dlRequested = useRef("");
+  // One-click update: armed by the confirm modal — once the download
+  // finishes, install+restart fire on their own (friends kept thinking
+  // "Update now" was done when the download bar filled).
+  const autoInstall = useRef(false);
   useEffect(() => {
     let alive = true;
     const poll = async () => {
@@ -118,6 +122,10 @@ export default function App() {
         }
         if (s.state !== "offer") dlRequested.current = "";
         setUpd(s);
+        if (autoInstall.current && s.state === "downloaded") {
+          autoInstall.current = false;
+          installAppUpdate().catch((e) => setUpdErr(String(e)));
+        }
       } catch {
         /* backend not ready */
       }
@@ -150,27 +158,17 @@ export default function App() {
     fn().catch(() => setUpdHidden(""));
   };
 
-  const onUpdateNow = async () => {
-    setUpdErr("");
-    if (upd) {
-      dlRequested.current = upd.version;
-      setUpd({ ...upd, state: "downloading", progress: 0 });
-    }
-    try {
-      await downloadAppUpdate();
-    } catch (e) {
-      dlRequested.current = "";
-      setUpdErr(String(e));
-    }
-  };
-  const onInstall = async () => {
+  // Both buttons lead to the same confirm — it's the ONE gate. From
+  // "offer" it downloads then auto-installs; from "downloaded" it just
+  // installs (a persisted download survives restarts).
+  const openUpdConfirm = async () => {
     setUpdErr("");
     try {
       setUpdHosting((await connectStatus()).mode === "hosting");
-      setUpdConfirm(true);
     } catch {
-      setUpdConfirm(true);
+      /* non-fatal */
     }
+    setUpdConfirm(true);
   };
 
   // Toggles don't await the report — last-issued must win, not
@@ -422,7 +420,7 @@ export default function App() {
                 {upd.source && <span className="dim"> from {upd.source}</span>}
                 {upd.notes && <span className="dim upd-notes">{upd.notes}</span>}
               </span>
-              <button onClick={onUpdateNow}>Update now</button>
+              <button onClick={openUpdConfirm}>Update now</button>
               <button onClick={() => openReleaseNotes(upd.version)}>
                 Read more
               </button>
@@ -436,11 +434,21 @@ export default function App() {
             <>
               <span>
                 downloading v{upd.version}… {(upd.progress * 100).toFixed(0)}%
+                {autoInstall.current && (
+                  <span className="dim"> — restarts &amp; installs itself when done</span>
+                )}
               </span>
               <div className="upd-prog">
                 <div style={{ width: `${upd.progress * 100}%` }} />
               </div>
-              <button onClick={() => updAction(() => cancelAppUpdate())}>Cancel</button>
+              <button
+                onClick={() => {
+                  autoInstall.current = false;
+                  updAction(() => cancelAppUpdate());
+                }}
+              >
+                Cancel
+              </button>
               <button onClick={() => setUpdHidden(updKey)}>Hide</button>
             </>
           )}
@@ -450,7 +458,7 @@ export default function App() {
                 update <b>v{upd.version}</b> verified — ready to install
                 {upd.notes && <span className="dim upd-notes">{upd.notes}</span>}
               </span>
-              <button onClick={onInstall}>Restart &amp; install</button>
+              <button onClick={openUpdConfirm}>Restart &amp; install</button>
               <button onClick={() => openReleaseNotes(upd.version)}>
                 Read more
               </button>
@@ -480,10 +488,21 @@ export default function App() {
       {updConfirm && upd && (
         <div className="upd-overlay" onClick={() => setUpdConfirm(false)}>
           <div className="upd-card" onClick={(e) => e.stopPropagation()}>
-            <h3>Install v{upd.version}?</h3>
+            <h3>Update to v{upd.version}?</h3>
             <p className="dim">
-              The app will close and the installer will run — takes a few
-              seconds, then v{upd.version} opens.
+              {upd.state === "downloaded" ? (
+                <>
+                  The app will close and the installer will run — takes a few
+                  seconds, then v{upd.version} opens.
+                </>
+              ) : (
+                <>
+                  Downloads
+                  {upd.size > 0 && ` ~${(upd.size / 1048576).toFixed(1)} MB`},
+                  then the app closes, installs v{upd.version}, and reopens
+                  itself — you don't have to do anything else.
+                </>
+              )}
             </p>
             {updHosting && (
               <p className="upd-warn">
@@ -499,10 +518,23 @@ export default function App() {
               <button
                 onClick={() => {
                   setUpdConfirm(false);
-                  installAppUpdate().catch((e) => setUpdErr(String(e)));
+                  if (upd.state === "downloaded") {
+                    installAppUpdate().catch((e) => setUpdErr(String(e)));
+                  } else {
+                    autoInstall.current = true;
+                    dlRequested.current = upd.version;
+                    setUpd({ ...upd, state: "downloading", progress: 0 });
+                    downloadAppUpdate().catch((e) => {
+                      autoInstall.current = false;
+                      dlRequested.current = "";
+                      setUpdErr(String(e));
+                    });
+                  }
                 }}
               >
-                Restart &amp; install
+                {upd.state === "downloaded"
+                  ? "Restart & install"
+                  : "Download & update"}
               </button>
               <button onClick={() => setUpdConfirm(false)}>Cancel</button>
             </div>
