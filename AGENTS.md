@@ -6,9 +6,10 @@ Tauri v2 desktop app — Rust backend (`src-tauri`), React+TS frontend (`src`), 
 
 - `cd src-tauri && cargo test --lib` — unit tests
 - `npx tsc --noEmit` — frontend typecheck
-- `cd src-tauri && cargo run --example sandbox --release` — full feature matrix
+- `cd src-tauri && cargo run --example sandbox` — full feature matrix
   (scan/build/load/connect + app-update); must end with **0 failure(s)** and
-  self-cleans its temp dir.
+  self-cleans its temp dir. Debug build is fine (~2min total vs ~4min
+  release) — deps are already opt-level=2.
 
 ## Connect (LAN modpack sync)
 
