@@ -862,6 +862,14 @@ pub fn run() {
         // window instead of spawning a zombie that can't bind the port.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             alog!("app", "second-instance launch — focusing the running one");
+            if app.get_webview_window("main").is_none() {
+                // Wedged instance with no window to focus — every launch
+                // hands off and dies, so the icon looks dead forever.
+                // Exit so the user's next click actually starts fresh.
+                alog!("app", "no main window to focus — exiting so relaunch recovers");
+                app.exit(0);
+                return;
+            }
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
