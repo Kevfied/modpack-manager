@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.1.22"
+version = "0.1.23"
 description = "Modpack Manager — Minecraft modpack builder"
 authors = ["you"]
 license = ""

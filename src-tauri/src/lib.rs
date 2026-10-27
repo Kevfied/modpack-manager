@@ -858,19 +858,22 @@ pub fn run() {
             // Session logging first — everything below writes to it.
             applog::init(&update_app_dir());
             alog!("app", "starting {}", env!("CARGO_PKG_VERSION"));
-            // First-run default: launch at login. The flag file doubles as
-            // "user configured this" — once it exists we never touch the
-            // registry entry again, so an explicit OFF stays off.
+            // Autostart: default ON, but only an explicit "0" means off.
+            // The flag file outlives reinstalls/updates — the registry Run
+            // key doesn't — so a once-written flag can't be trusted; check
+            // the real key every launch and re-assert when wanted.
             let auto_flag = update_app_dir().join("autostart-configured");
-            if !auto_flag.exists() {
+            let want = std::fs::read_to_string(&auto_flag).unwrap_or_default();
+            if want.trim() != "0" {
                 use tauri_plugin_autostart::ManagerExt;
-                match app.autolaunch().enable() {
-                    Ok(()) => {
-                        let _ = std::fs::write(&auto_flag, "1");
-                        alog!("app", "autostart enabled by default");
+                let al = app.autolaunch();
+                if !al.is_enabled().unwrap_or(false) {
+                    match al.enable() {
+                        Ok(()) => alog!("app", "autostart enabled"),
+                        Err(e) => alog!("app", "autostart enable failed: {e}"),
                     }
-                    Err(e) => alog!("app", "autostart default enable failed: {e}"),
                 }
+                let _ = std::fs::write(&auto_flag, "1");
             }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
