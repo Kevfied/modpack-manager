@@ -54,6 +54,11 @@ windows-sys = { version = "0.60", features = [
 [profile.dev.package."*"]
 opt-level = 2
 
+# Keep line tables in release — panic-hook backtraces stay readable
+# (file:line instead of <unknown>) for field logs we can't reproduce.
+[profile.release]
+debug = 1
+
 [dev-dependencies]
 filetime = "0.2.29"
 minisign = "0.10.0"

@@ -1941,6 +1941,16 @@ fn mark_host_contact(cs: &SharedClient, ok: bool) {
     }
 }
 
+/// Spawn on whatever runtime exists — `tokio::spawn` panics off-runtime,
+/// and resume() can run on bare threads (Tauri setup()).
+fn spawn_rt<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(fut);
+    } else {
+        tauri::async_runtime::spawn(fut);
+    }
+}
+
 fn spawn_heartbeat(cs: SharedClient) {
     let my_token = cs
         .lock()
@@ -1948,7 +1958,7 @@ fn spawn_heartbeat(cs: SharedClient) {
         .as_ref()
         .map(|c| c.hb_token)
         .unwrap_or(0);
-    tokio::spawn(async move {
+    spawn_rt(async move {
         let http = reqwest::Client::new();
         let mut wake_rx = hb_wake_gen().subscribe();
         loop {

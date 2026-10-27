@@ -1423,8 +1423,19 @@ fn main() {
         );
         let cs2: sync::SharedClient = Arc::new(Mutex::new(None));
         let hs2: sync::SharedHost = Arc::new(Mutex::new(None));
-        // can't re-host on same port — client resume only
-        sync::resume(&hs2, &cs2, &store_path, &sync_root);
+        // can't re-host on same port — client resume only.
+        // Run it on a BARE thread (no Tokio context) — that's exactly
+        // what Tauri setup() does; calling it from #[tokio::main] hid the
+        // spawn_heartbeat "no reactor" panic that killed real launches.
+        {
+            let hs3 = hs2.clone();
+            let cs3 = cs2.clone();
+            let sp3 = store_path.clone();
+            let root3 = sync_root.clone();
+            std::thread::spawn(move || sync::resume(&hs3, &cs3, &sp3, &root3))
+                .join()
+                .expect("resume must not panic on a non-Tokio thread");
+        }
         {
             let g = cs2.lock().unwrap();
             check(g.is_some(), "client session restored from connect.json");

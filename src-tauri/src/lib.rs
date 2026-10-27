@@ -938,10 +938,21 @@ pub fn run() {
             // someone opened the tab. Sessions must not depend on the UI.
             alog!("app", "resuming saved sessions…");
             if let Ok(root) = sync::synced_root() {
-                sync::resume(&st.host, &st.sync_client, &sync::store_path(), &root);
+                let host = st.host.clone();
+                let cs = st.sync_client.clone();
+                let sp = sync::store_path();
+                // Client resume calls spawn_heartbeat → tokio::spawn —
+                // setup() runs without a reactor, so a saved member
+                // session PANICKED and killed every launch after the
+                // first. Resume on the async runtime's blocking pool,
+                // which carries the Tokio context spawn() needs.
+                tauri::async_runtime::spawn_blocking(move || {
+                    sync::resume(&host, &cs, &sp, &root);
+                    crate::alog!("app", "session resume done");
+                });
                 st.resumed.store(true, Ordering::Relaxed);
             }
-            alog!("app", "session resume returned");
+            alog!("app", "session resume dispatched");
 
             // Tray: X hides to the icon; real quit lives on the menu.
             alog!("app", "building tray…");
