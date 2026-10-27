@@ -185,7 +185,11 @@ fn save_store(app_dir: &Path, s: &AppUpdateStore) {
         if let Some(p) = f.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        let _ = std::fs::write(f, j);
+        // Atomic: readers and crashes must never see a half-written store.
+        let tmp = f.with_extension("tmp");
+        if std::fs::write(&tmp, j).is_ok() {
+            let _ = std::fs::rename(&tmp, &f);
+        }
     }
 }
 
@@ -844,48 +848,108 @@ async fn try_download_from(
         let _ = std::fs::remove_file(&part_path);
         have = 0;
     }
-    let mut req = http
-        .get(format!("http://{}/app/file?name={}", seeder.addr, url_encode(&m.file)))
-        .timeout(Duration::from_secs(15));
-    if have > 0 {
-        req = req.header("Range", format!("bytes={have}-"));
-    }
-    let mut r = req.send().await?;
-    let status = r.status().as_u16();
-    if status == 416 {
-        let _ = std::fs::remove_file(&part_path);
-        anyhow::bail!("range rejected");
-    }
-    r.error_for_status_ref()?;
-    let append = status == 206 && have > 0;
-    if let Some(len) = r.content_length() {
-        if !append && len != m.size {
-            anyhow::bail!("size mismatch from seeder");
-        }
-    }
+    // Connect bounds only connect+stalls, never a total deadline — a 5 MB
+    // pull over a VPN link can't be held to seconds. Dropped connections
+    // retry-and-resume off the surviving .part (same pattern as Connect
+    // file sync: a transient cut used to fail the whole update with
+    // "error decoding response body").
+    let url = format!("http://{}/app/file?name={}", seeder.addr, url_encode(&m.file));
+    let mut done;
     use std::io::Write;
-    let mut out = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(&part_path)?;
-    let mut done = if append { have } else { 0 };
-    {
-        let mut st = dl_state().lock().unwrap();
-        st.done = done;
-        st.total = m.size;
-    }
-    while let Some(chunk) = r.chunk().await? {
-        if dl_state().lock().unwrap().cancel {
-            anyhow::bail!("cancelled");
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let mut req = http.get(&url);
+        if have > 0 {
+            req = req.header("Range", format!("bytes={have}-"));
         }
-        out.write_all(&chunk)?;
-        done += chunk.len() as u64;
-        dl_state().lock().unwrap().done = done;
-        progress(done, m.size);
+        // Bound connect+headers only — never the body.
+        let mut r = match tokio::time::timeout(Duration::from_secs(10), req.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                if attempt >= 3 {
+                    return Err(e.into());
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(_) => {
+                if attempt >= 3 {
+                    anyhow::bail!("seeder unreachable");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        let status = r.status().as_u16();
+        if status == 416 {
+            let _ = std::fs::remove_file(&part_path);
+            anyhow::bail!("range rejected");
+        }
+        r.error_for_status_ref()?;
+        let append = status == 206 && have > 0;
+        if let Some(len) = r.content_length() {
+            if !append && len != m.size {
+                anyhow::bail!("size mismatch from seeder");
+            }
+        }
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(&part_path)?;
+        done = if append { have } else { 0 };
+        {
+            let mut st = dl_state().lock().unwrap();
+            st.done = done;
+            st.total = m.size;
+        }
+        // Stream the body with a per-chunk stall guard — no bytes for 30s
+        // means the link's dead; retry resumes from the .part offset.
+        let mut stream_err: Option<anyhow::Error> = None;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), r.chunk()).await {
+                Err(_) => {
+                    stream_err = Some(anyhow::anyhow!("stalled (no data for 30s)"));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    stream_err = Some(e.into());
+                    break;
+                }
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => {
+                    if dl_state().lock().unwrap().cancel {
+                        stream_err = Some(anyhow::anyhow!("cancelled"));
+                        break;
+                    }
+                    out.write_all(&chunk)?;
+                    done += chunk.len() as u64;
+                    dl_state().lock().unwrap().done = done;
+                    progress(done, m.size);
+                }
+            }
+        }
+        drop(out);
+        // A clean end short of the manifest size is the same as a cut.
+        if stream_err.is_none() && done != m.size {
+            stream_err = Some(anyhow::anyhow!("incomplete download"));
+        }
+        match stream_err {
+            None => break,
+            Some(e) => {
+                if dl_state().lock().unwrap().cancel {
+                    return Err(e);
+                }
+                have = part_path.metadata().map(|x| x.len()).unwrap_or(0);
+                if attempt >= 3 {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
     }
-    drop(out);
     if done != m.size {
         anyhow::bail!("incomplete download");
     }
@@ -1006,17 +1070,66 @@ pub fn prepare_install(dir: &Path) -> Result<PathBuf> {
 /// app once it finishes, so an update is a single click end-to-end.
 pub fn install_app_update(dir: &Path) -> Result<String> {
     let p = prepare_install(dir)?;
-    // Run via a .cmd so we can wait for the install to finish before relaunching
-    // the app. The 2s delay gives our process time to exit before NSIS starts —
-    // a running app would block the file swap or trigger a close prompt.
+    // Run via a .cmd — a naive "wait 2s, run installer, relaunch" strand
+    // people: WebView2 can outlive the window (installer hits a locked exe)
+    // and NSIS forks a helper child that keeps copying after its parent
+    // returns, so relaunching immediately can start a half-written exe.
     let script = dl_dir(dir).join("update.cmd");
     let exe = std::env::current_exe()
         .map(|e| e.display().to_string())
         .unwrap_or_default();
+    let prev = dl_dir(dir)
+        .join("prev")
+        .join(
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "ModpackManager-prev.exe".into()),
+        )
+        .display()
+        .to_string();
     let body = format!(
-        "@echo off\r\n\"%SystemRoot%\\System32\\timeout.exe\" /t 2 /nobreak >nul\r\n\"{}\" /S\r\nstart \"\" \"{}\"\r\n",
-        p.display(),
-        exe
+        concat!(
+            "@echo off\r\n",
+            "setlocal EnableDelayedExpansion\r\n",
+            "set \"APP={exe}\"\r\n",
+            "set \"PREV={prev}\"\r\n",
+            "set tries=0\r\n",
+            ":waitexit\r\n",
+            // timeout.exe needs a console — this runs CREATE_NO_WINDOW, so
+            // it fails instantly; ping -n is the headless-safe ~1s sleep.
+            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            // Exe is writable only once the old process is truly gone.
+            "2>nul ( >>\"%APP%\" (call ) ) && goto unlocked\r\n",
+            "set /a tries+=1\r\n",
+            "if !tries! lss 60 goto waitexit\r\n",
+            ":unlocked\r\n",
+            "\"{installer}\" /S\r\n",
+            "set tries=0\r\n",
+            "set lasts=x\r\n",
+            ":waitfile\r\n",
+            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            "set /a tries+=1\r\n",
+            "if !tries! geq 120 goto restore\r\n",
+            "if not exist \"%APP%\" goto waitfile\r\n",
+            "for %%A in (\"%APP%\") do set cur=%%~zA\r\n",
+            "if not \"!cur!\"==\"!lasts!\" (\r\n",
+            "  set lasts=!cur!\r\n",
+            "  goto waitfile\r\n",
+            ")\r\n",
+            "if \"!cur!\"==\"0\" goto waitfile\r\n",
+            "if \"!cur!\"==\"\" goto waitfile\r\n",
+            "goto launch\r\n",
+            // Install never produced an exe — put the backup back so the
+            // app still opens (old version) instead of leaving a dead icon.
+            ":restore\r\n",
+            "if not exist \"%APP%\" copy /y \"%PREV%\" \"%APP%\" >nul\r\n",
+            ":launch\r\n",
+            "start \"\" \"%APP%\"\r\n",
+        ),
+        exe = exe,
+        prev = prev,
+        installer = p.display(),
     );
     std::fs::write(&script, body).context("failed to write update.cmd")?;
     let mut cmd = std::process::Command::new("cmd.exe");

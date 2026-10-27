@@ -100,7 +100,10 @@ if ($BundleDir) {
         $newVer = $parts -join "."
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         foreach ($f in @($TauriConf, $CargoToml, (Join-Path $Repo "package.json"))) {
-            $text = Get-Content $f -Raw
+            # -Encoding UTF8 is REQUIRED on the read: without it PS5 decodes
+            # via the ANSI codepage and every bump re-mangles UTF-8 (Cargo.toml's
+            # em-dash grew to 141MB of mojibake before GitHub rejected it).
+            $text = Get-Content $f -Raw -Encoding UTF8
             $text = $text -replace '(?m)("version"\s*:\s*|^version = )"[^"]+"', "`$1`"$newVer`""
             [System.IO.File]::WriteAllText($f, $text, $utf8NoBom)
         }

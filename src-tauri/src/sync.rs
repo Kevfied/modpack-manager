@@ -416,7 +416,11 @@ fn save_store(path: &Path, store: &Store) {
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    let _ = std::fs::write(path, serde_json::to_string_pretty(store).unwrap_or_default());
+    // Atomic: a reader (or a crash) must never see a half-written store.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, serde_json::to_string_pretty(store).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// Every load+modify+save MUST hold this — a writer working off a stale
