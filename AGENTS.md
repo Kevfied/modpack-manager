@@ -42,6 +42,11 @@ Strict rule: nothing is published/applied without an explicit user action.
   resolve loader version). Connect member apply, host apply
   (`load_host_pack`), and Loader-folder loads all funnel through it —
   don't fork the logic.
+- Launcher detection (`launchers::detect`) must be evidence-based:
+  `.minecraft` alone is NOT the official launcher (every custom launcher
+  uses it) — it requires the launcher exe / Store package. SKLauncher is
+  `sklauncher` kind → vanilla-style deploy (3.x reads .minecraft, 4.0
+  imports from "Official launcher").
 - Monochrome dark UI, sharp edges, monospace; tab order Loader | Mods | Build
   | Connect (Connect default — members live there).
 - Async Tauri commands; no std MutexGuard held across `.await`.

@@ -33,6 +33,7 @@ const LOADER_ICON: Record<string, string> = {
   prism: "◆",
   vanilla: "■",
   tlauncher: "▲",
+  sklauncher: "▶",
 };
 
 export default function LoaderView(props: Props) {

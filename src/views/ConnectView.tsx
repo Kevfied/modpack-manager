@@ -725,8 +725,8 @@ export default function ConnectView(_props: Props) {
             <h3>Load into Minecraft</h3>
             {launchers.length === 0 ? (
               <div className="dim">
-                No launcher detected — install Minecraft, TLauncher or
-                Prism, or use the Loader tab.
+                No launcher detected — install Minecraft, TLauncher,
+                SKLauncher or Prism, or use the Loader tab.
               </div>
             ) : (
               <>
@@ -897,7 +897,7 @@ export default function ConnectView(_props: Props) {
     } else if (status.appliedVersion > 0 && launchers.length === 0) {
       guideSteps.push({
         icon: "•",
-        text: `No launcher detected — install TLauncher or Prism first (the list below re-scans automatically)`,
+        text: `No launcher detected — install TLauncher, SKLauncher or Prism first (the list below re-scans automatically)`,
         cls: "wait",
       });
     } else if (status.appliedVersion > 0) {
@@ -1046,7 +1046,7 @@ export default function ConnectView(_props: Props) {
             {launchers.length === 0 ? (
               <div className="dim">
                 Pack is synced — but no launcher was detected. Install
-                Minecraft, TLauncher or Prism, or use the Loader tab.
+                Minecraft, TLauncher, SKLauncher or Prism, or use the Loader tab.
               </div>
             ) : (
               <>
@@ -1091,7 +1091,7 @@ export default function ConnectView(_props: Props) {
               {launchers.length === 0 ? (
                 <p className="dim">
                   No launcher was detected — use the Loader tab, or install
-                  Minecraft / TLauncher / Prism.
+                  Minecraft / TLauncher / SKLauncher / Prism.
                 </p>
               ) : (
                 <>

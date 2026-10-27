@@ -29,6 +29,23 @@ pub fn detect() -> DetectedLoaders {
     let mut launchers = vec![];
     let mut installed_versions = vec![];
 
+    // "Vanilla" means the OFFICIAL launcher — .minecraft alone is not proof:
+    // TLauncher, SKLauncher and every custom launcher use the same game dir.
+    // Require the launcher's own footprint so it stops showing up for people
+    // who only ever ran a third-party launcher.
+    let official_launcher = {
+        let exes = [
+            PathBuf::from(r"C:\Program Files (x86)\Minecraft Launcher\MinecraftLauncher.exe"),
+            PathBuf::from(r"C:\Program Files\Minecraft Launcher\MinecraftLauncher.exe"),
+        ];
+        exes.iter().any(|p| p.is_file())
+            || dirs::data_local_dir()
+                .map(|d| d.join(r"Microsoft\WindowsApps\MinecraftLauncher.exe"))
+                .is_some_and(|p| p.is_file())
+            || dirs::data_local_dir()
+                .map(|d| d.join(r"Packages\Microsoft.4297127D64EC6_8wekyb3d8bbwe"))
+                .is_some_and(|p| p.is_dir())
+    };
     if let Some(mc) = minecraft_dir() {
         installed_versions = std::fs::read_dir(mc.join("versions"))
             .map(|rd| {
@@ -40,12 +57,14 @@ pub fn detect() -> DetectedLoaders {
             .unwrap_or_default();
         installed_versions.sort();
 
-        launchers.push(LauncherInfo {
-            kind: "vanilla".into(),
-            name: "Minecraft Launcher (.minecraft)".into(),
-            path: None,
-            data_dir: Some(mc.to_string_lossy().to_string()),
-        });
+        if official_launcher {
+            launchers.push(LauncherInfo {
+                kind: "vanilla".into(),
+                name: "Minecraft Launcher (.minecraft)".into(),
+                path: None,
+                data_dir: Some(mc.to_string_lossy().to_string()),
+            });
+        }
     }
 
     // TLauncher: game dir comes from .tlauncher/tlauncher-2.0.properties
@@ -80,6 +99,27 @@ pub fn detect() -> DetectedLoaders {
                 installed_versions.sort();
                 installed_versions.dedup();
             }
+        }
+    }
+
+    // SKLauncher: 4.0 keeps data+instances in %APPDATA%\.sklauncher, the
+    // setup build drops SKlauncher.jar in %APPDATA%\sklauncher, and 3.x
+    // leaves a sklauncher dir inside .minecraft. The game dir stays
+    // .minecraft (vanilla profile/versions layout — 3.x reads it natively,
+    // 4.0 imports it via "Import → Official launcher").
+    let skl = dirs::data_dir()
+        .map(|d| d.join(".sklauncher"))
+        .filter(|p| p.is_dir())
+        .or_else(|| dirs::data_dir().map(|d| d.join("sklauncher")).filter(|p| p.is_dir()))
+        .or_else(|| minecraft_dir().map(|d| d.join("sklauncher")).filter(|p| p.is_dir()));
+    if skl.is_some() {
+        if let Some(mc) = minecraft_dir() {
+            launchers.push(LauncherInfo {
+                kind: "sklauncher".into(),
+                name: "SKLauncher".into(),
+                path: skl.map(|p| p.to_string_lossy().to_string()),
+                data_dir: Some(mc.to_string_lossy().to_string()),
+            });
         }
     }
 
@@ -1087,10 +1127,14 @@ pub async fn deploy_mods_dir(
             }
             let version_id = ensure_loader_version(client, &mc, cfg, &mut log).await?;
             add_launcher_profile(&mc, &cfg.name, &version_id, &instance)?;
-            log.push_str(&format!(
-                "✓ profile \"{}\" ready — open your launcher, pick it, press Play",
-                cfg.name
-            ));
+            // SKLauncher 3.x reads .minecraft profiles natively; 4.0 pulls
+            // them in via Import → Official launcher.
+            let hint = if launcher.kind == "sklauncher" {
+                "open SKLauncher — it appears in installations (4.0: Import → Official launcher if hidden)"
+            } else {
+                "open your launcher, pick it, press Play"
+            };
+            log.push_str(&format!("✓ profile \"{}\" ready — {hint}", cfg.name));
         }
     }
     Ok(log)
