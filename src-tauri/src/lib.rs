@@ -557,6 +557,19 @@ async fn load_synced_pack(
         .map_err(|e| e.to_string())
 }
 
+/// The host loading their own published pack into a launcher — their
+/// "apply" is just pointing the same deploy path at their live folder.
+#[tauri::command]
+async fn load_host_pack(
+    state: tauri::State<'_, AppState>,
+    launcher: LauncherInfo,
+) -> Result<String, String> {
+    let root = launchers::instances_root().map_err(|e| e.to_string())?;
+    sync::load_host_pack(&state.host, &state.client, &root, &launcher)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------- app updates
 
 fn update_app_dir() -> std::path::PathBuf {
@@ -983,6 +996,7 @@ pub fn run() {
             decline_update,
             list_synced_packs,
             load_synced_pack,
+            load_host_pack,
             app_update_status,
             download_app_update,
             cancel_app_update,

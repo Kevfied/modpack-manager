@@ -2762,49 +2762,6 @@ pub fn list_synced_packs(root: &Path) -> Vec<SyncedPackInfo> {
     out
 }
 
-/// Mirror jars src→dest (flattened by filename), then remove any dest
-/// jars the source no longer has — a pack instance we manage should match
-/// the pack, not accumulate jars the host removed. Non-jar files and
-/// subdirs in dest are left alone. Returns (copied, removed).
-fn sync_jars(src_dir: &Path, dest_mods: &Path) -> Result<(usize, usize)> {
-    std::fs::create_dir_all(dest_mods)?;
-    let mut count = 0usize;
-    let mut want = HashSet::new();
-    let mut stack = vec![src_dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d)?.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().map(|x| x == "jar").unwrap_or(false) {
-                let name = p
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                want.insert(name.clone());
-                std::fs::copy(&p, dest_mods.join(&name))?;
-                count += 1;
-            }
-        }
-    }
-    let mut removed = 0usize;
-    if let Ok(rd) = std::fs::read_dir(dest_mods) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let is_jar = p.is_file() && p.extension().map(|x| x == "jar").unwrap_or(false);
-            let in_pack = p
-                .file_name()
-                .map(|f| want.contains(&f.to_string_lossy().into_owned()))
-                .unwrap_or(false);
-            if is_jar && !in_pack {
-                let _ = std::fs::remove_file(&p);
-                removed += 1;
-            }
-        }
-    }
-    Ok((count, removed))
-}
-
 /// Load a synced pack into a launcher (copy jars + loader + profile/instance).
 pub async fn load_synced_pack(
     client: &crate::modrinth::ModrinthClient,
@@ -2844,77 +2801,52 @@ pub async fn load_synced_pack(
             cfg.loader_version = lv;
         }
     }
-    let mods_dir = dir.join("mods");
-    let mut log = String::new();
+    launchers::deploy_mods_dir(client, &dir.join("mods"), &cfg, launcher, root).await
+}
 
-    match launcher.kind.as_str() {
-        "prism" => {
-            let dd = launcher.data_dir.as_deref().context("prism data dir not found")?;
-            let id = pack::slugify(&cfg.name);
-            let inst = Path::new(dd).join("instances").join(&id);
-            let gamedir = inst.join(".minecraft");
-            let (n, removed) = sync_jars(&mods_dir, &gamedir.join("mods"))?;
-            if removed > 0 {
-                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
-            }
-            std::fs::write(
-                inst.join("instance.cfg"),
-                format!("InstanceType=OneSix\nname={}\nicon=default\n", cfg.name),
-            )?;
-            std::fs::write(
-                inst.join("mmc-pack.json"),
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "formatVersion": 1,
-                    "components": [
-                        { "uid": "net.minecraft", "version": cfg.mc_version },
-                        { "uid": launchers::prism_component_uid(&cfg.loader)?,
-                          "version": cfg.loader_version, "important": true }
-                    ]
-                }))?,
-            )?;
-            log.push_str(&format!(
-                "✓ wrote Prism instance \"{id}\" — {n} mod(s) ({} {})",
-                cfg.loader, cfg.loader_version
-            ));
+/// The host's "apply" — they already have the files, so deploy their live
+/// folder straight into a launcher. Whatever they last published (name,
+/// versions) is the meta; same deploy path members' applied packs take.
+pub async fn load_host_pack(
+    hs: &SharedHost,
+    client: &crate::modrinth::ModrinthClient,
+    root: &Path,
+    launcher: &LauncherInfo,
+) -> Result<String> {
+    let (folder, mut cfg) = {
+        let g = hs.lock().unwrap();
+        let h = g.as_ref().context("not hosting")?;
+        if h.manifest.version == 0 {
+            anyhow::bail!("nothing published yet — publish the pack first");
         }
-        "tlauncher" => {
-            let mc = launcher
-                .data_dir
-                .as_deref()
-                .map(PathBuf::from)
-                .filter(|p| p.is_dir())
-                .or_else(launchers::tlauncher_gamedir)
-                .context("TLauncher game dir not found")?;
-            let gamedir =
-                launchers::tlauncher_stage_version(client, &mc, &cfg, &mut log).await?;
-            let (n, removed) = sync_jars(&mods_dir, &gamedir.join("mods"))?;
-            log.push_str(&format!("✓ staged {n} mod(s)\n"));
-            if removed > 0 {
-                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
-            }
-            log.push_str(&format!(
-                "✓ \"{}\" in TLauncher version list — open TLauncher, pick it, press Play",
-                cfg.name
-            ));
+        let mut pack_version = h.pack_version.clone();
+        if pack_version.is_empty() {
+            pack_version = format!("v{}", h.manifest.version);
         }
-        _ => {
-            let mc = launchers::minecraft_dir().context(".minecraft not found")?;
-            let instance = root.join(pack::slugify(&cfg.name));
-            let (n, removed) = sync_jars(&mods_dir, &instance.join("mods"))?;
-            log.push_str(&format!("✓ staged {n} mod(s)\n"));
-            if removed > 0 {
-                log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
-            }
-            let version_id =
-                launchers::ensure_loader_version(client, &mc, &cfg, &mut log).await?;
-            launchers::add_launcher_profile(&mc, &cfg.name, &version_id, &instance)?;
-            log.push_str(&format!(
-                "✓ profile \"{}\" ready — open your launcher, pick it, press Play",
-                cfg.name
-            ));
+        (
+            h.folder.clone(),
+            pack::PackConfig {
+                name: h.pack_name.clone(),
+                version: pack_version,
+                summary: String::new(),
+                mc_version: h.mc_version.clone(),
+                loader: h.loader.clone(),
+                loader_version: h.loader_version.clone(),
+                selected_paths: vec![],
+            },
+        )
+    };
+    if cfg.loader_version.is_empty() {
+        if let Some(lv) = client
+            .loader_versions(&cfg.loader, &cfg.mc_version)
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+        {
+            cfg.loader_version = lv;
         }
     }
-    Ok(log)
+    launchers::deploy_mods_dir(client, &folder, &cfg, launcher, root).await
 }
 
 // ------------------------------------------------------- status / resume

@@ -37,6 +37,11 @@ Strict rule: nothing is published/applied without an explicit user action.
 
 ## Conventions
 
+- One way to turn "folder of jars + pack meta" into a playable launcher
+  entry: `launchers::deploy_mods_dir` (mirror-copy jars, prune stale,
+  resolve loader version). Connect member apply, host apply
+  (`load_host_pack`), and Loader-folder loads all funnel through it —
+  don't fork the logic.
 - Monochrome dark UI, sharp edges, monospace; tab order Loader | Mods | Build
   | Connect (Connect default — members live there).
 - Async Tauri commands; no std MutexGuard held across `.await`.

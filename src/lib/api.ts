@@ -387,6 +387,10 @@ export const listSyncedPacks = () =>
 export const loadSyncedPack = (networkId: string, launcher: LauncherInfo) =>
   invoke<string>("load_synced_pack", { networkId, launcher });
 
+/** Host installs their own published pack — same deploy, live folder. */
+export const loadHostPack = (launcher: LauncherInfo) =>
+  invoke<string>("load_host_pack", { launcher });
+
 // ---- App updates (LAN, standalone from Connect) ----
 
 export interface AppUpdateStatus {

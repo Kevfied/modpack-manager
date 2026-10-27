@@ -8,6 +8,7 @@ import {
   loadSyncedPack,
   packExists,
   packFileInfo,
+  suggestPackMeta,
 } from "../lib/api";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type {
@@ -106,14 +107,42 @@ export default function LoaderView(props: Props) {
     }
   };
 
+  // A bare folder of .jar files works too — same deploy path the Connect
+  // "apply" uses, with loader/MC guessed from the jars themselves.
+  const pickPackFolder = async () => {
+    const dir = await open({ directory: true, title: "Pick a folder of mods" });
+    if (typeof dir !== "string") return;
+    setPackFile(dir);
+    setPackInfo(null);
+    try {
+      const m = await suggestPackMeta(dir);
+      setPackInfo({
+        name: m.packName,
+        mcVersion: m.mcVersion,
+        loader: m.loader,
+        loaderVersion: m.loaderVersion,
+      });
+    } catch {
+      /* info is optional — ignore */
+    }
+  };
+
   const launchFile = async (l: LauncherInfo) => {
     if (!packFile) return;
-    const name = packInfo?.name ?? cfg.name;
+    const name = packInfo?.name || cfg.name;
     if (!(await confirmOverwrite(l, name))) return;
     setBusy(`file-${l.kind}`);
     pushLog(`> ${l.name}: loading ${packFile.split(/[\\/]/).pop()}…`);
     try {
-      pushLog(await loadPackFile(l, packFile, { ...makeConfig(), name }));
+      pushLog(
+        await loadPackFile(l, packFile, {
+          ...makeConfig(),
+          name,
+          mcVersion: packInfo?.mcVersion || cfg.mcVersion,
+          loader: packInfo?.loader || cfg.loader,
+          loaderVersion: packInfo?.loaderVersion || cfg.loaderVersion,
+        })
+      );
     } catch (e) {
       pushLog(`x ${e}`);
     } finally {
@@ -166,9 +195,10 @@ export default function LoaderView(props: Props) {
       )}
 
       <div className="panel">
-        <h3>From a pack file</h3>
+        <h3>From a pack file or mods folder</h3>
         <div className="toolbar">
           <button onClick={pickPackFile}>Choose .mrpack / .zip…</button>
+          <button onClick={pickPackFolder}>Choose mods folder…</button>
           {packFile && <span className="mono dim">{packFile}</span>}
         </div>
         {packInfo && (
@@ -185,7 +215,10 @@ export default function LoaderView(props: Props) {
             <div className="dim">No launchers detected.</div>
           ))}
         {!packFile && (
-          <div className="dim">Give it a pack file and pick where to load it.</div>
+          <div className="dim">
+            Give it a pack file — or just a folder of .jar mods — and pick
+            where to load it.
+          </div>
         )}
       </div>
 

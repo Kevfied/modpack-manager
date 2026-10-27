@@ -19,6 +19,7 @@ import {
   joinNetwork,
   leaveNetwork,
   listSyncedPacks,
+  loadHostPack,
   loadSyncedPack,
   packExists,
   scanNetworks,
@@ -161,36 +162,43 @@ export default function ConnectView(_props: Props) {
   // and keep them fresh so a newly installed launcher shows up live.
   const applied = status?.appliedVersion ?? 0;
   const joined = status?.mode === "joined";
+  const hosting = status?.mode === "hosting";
   const nid = status?.networkId ?? null;
   useEffect(() => {
-    if (!joined || applied === 0) return;
+    if (!(joined || hosting) || applied === 0) return;
     const load = () => {
-      listSyncedPacks()
-        .then(async (packs) => {
-          const p = packs.find((p) => p.networkId === nid) ?? null;
-          setSyncedPack(p);
-          const name = p?.name || status?.networkName || "Synced Pack";
-          const d = await detectLaunchers();
-          setLaunchers(d.launchers);
-          // Which launcher (if any) already holds this pack — drives the
-          // persistent "installed ✓" state + the guide's done step.
-          const hits = await Promise.all(
-            d.launchers.map(async (l) => ((await packExists(l, name)) ? l.name : null))
-          );
-          setInstalledIn(hits.find((x) => x) ?? null);
-        })
-        .catch((e) => pushLog(`x launcher detection: ${e}`));
+      (async () => {
+        // Pack name for the installed-✓ probe: hosts use their own pack
+        // name, members resolve it from the synced copy's pack.json.
+        const name = hosting
+          ? status?.packName ?? "Pack"
+          : await listSyncedPacks().then((packs) => {
+              const p = packs.find((p) => p.networkId === nid) ?? null;
+              setSyncedPack(p);
+              return p?.name || status?.networkName || "Synced Pack";
+            });
+        const d = await detectLaunchers();
+        setLaunchers(d.launchers);
+        // Which launcher (if any) already holds this pack — drives the
+        // persistent "installed ✓" state + the guide's done step.
+        const hits = await Promise.all(
+          d.launchers.map(async (l) => ((await packExists(l, name)) ? l.name : null))
+        );
+        setInstalledIn(hits.find((x) => x) ?? null);
+      })().catch((e) => pushLog(`x launcher detection: ${e}`));
     };
     load();
     const t = window.setInterval(() => {
       if (!appHidden.current) load();
     }, 5000);
     return () => window.clearInterval(t);
-  }, [joined, applied, nid]);
+  }, [joined, hosting, applied, nid]);
 
   const loadSyncedInto = async (l: LauncherInfo) => {
-    if (!nid) return;
-    const name = syncedPack?.name || status?.networkName || "Synced Pack";
+    const name = hosting
+      ? status?.packName ?? "Pack"
+      : syncedPack?.name || status?.networkName || "Synced Pack";
+    if (!hosting && !nid) return;
     if (
       (await packExists(l, name)) &&
       !(await confirm(
@@ -203,7 +211,9 @@ export default function ConnectView(_props: Props) {
     setBusy(true);
     pushLog(`> ${l.name}: installing "${name}" v${applied}…`);
     try {
-      pushLog(await loadSyncedPack(nid, l));
+      // Hosts deploy their live folder; members deploy the synced copy —
+      // the backend funnels both through the same code.
+      pushLog(hosting ? await loadHostPack(l) : await loadSyncedPack(nid!, l));
       setInstalledIn(l.name); // instant "go play" — poll confirms later
     } catch (e) {
       pushLog(`x ${e}`);
@@ -748,6 +758,37 @@ export default function ConnectView(_props: Props) {
           <h3>Members</h3>
           {membersTable(true) ?? <div className="dim">Nobody's joined yet.</div>}
         </div>
+        {status.latestVersion > 0 && (
+          <div className="panel">
+            <h3>Load into Minecraft</h3>
+            {launchers.length === 0 ? (
+              <div className="dim">
+                No launcher detected — install Minecraft, TLauncher or
+                Prism, or use the Loader tab.
+              </div>
+            ) : (
+              <>
+                <div className="dim" style={{ marginBottom: 8 }}>
+                  Want to play too? Installs "{status.packName}" (v
+                  {status.latestVersion}) from your shared folder — same
+                  pack your members get:
+                </div>
+                {launchers.map((l) => (
+                  <button
+                    key={l.kind}
+                    className="primary"
+                    style={{ marginRight: 8, marginBottom: 6 }}
+                    disabled={busy}
+                    onClick={() => loadSyncedInto(l)}
+                  >
+                    {l.name}
+                    {installedIn === l.name ? " ✓" : ""}
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        )}
         {log.length > 0 && (
           <div className="log-box">
             {log.map((l, i) => (

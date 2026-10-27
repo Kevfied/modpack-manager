@@ -1527,6 +1527,59 @@ fn main() {
             "pack jar still present after mirror",
         );
         let _ = vanilla; // vanilla path needs a real .minecraft — covered by packtest
+
+        // Host-side apply: the host's own live folder deploys through the
+        // same shared path the member's synced copy took.
+        let h_folder = hs.lock().unwrap().as_ref().unwrap().folder.clone();
+        let want = std::fs::read_dir(&h_folder)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "jar").unwrap_or(false))
+            .count();
+        match sync::load_host_pack(&hs, &mr_client, &inst_root, &prism).await {
+            Ok(l) => {
+                println!("{l}");
+                let got = std::fs::read_dir(inst.join(".minecraft/mods"))
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().map(|x| x == "jar").unwrap_or(false))
+                    .count();
+                check(got == want, "host apply mirrors live folder into launcher");
+            }
+            Err(e) => check(false, &format!("load_host_pack failed: {e}")),
+        }
+
+        // A bare mods folder (Loader tab) rides the same deploy path.
+        let folder_cfg = pack::PackConfig {
+            name: "Folder Pack".into(),
+            version: "1.0".into(),
+            summary: String::new(),
+            mc_version: "1.21.1".into(),
+            loader: "fabric".into(),
+            loader_version: "0.15.11".into(),
+            selected_paths: vec![],
+        };
+        match launchers::load_pack_file(&mr_client, &prism, host_mods.to_str().unwrap(), &folder_cfg).await {
+            Ok(l) => {
+                println!("{l}");
+                let finst = prism_dir.join("instances/folder-pack");
+                let src_count = std::fs::read_dir(&host_mods)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().map(|x| x == "jar").unwrap_or(false))
+                    .count();
+                let got = std::fs::read_dir(finst.join(".minecraft/mods"))
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().map(|x| x == "jar").unwrap_or(false))
+                    .count();
+                check(
+                    finst.join("mmc-pack.json").is_file() && got == src_count,
+                    "mods folder → load_pack_file → prism instance",
+                );
+            }
+            Err(e) => check(false, &format!("folder load_pack_file failed: {e}")),
+        }
     });
 
     // ---- 11c. heartbeat wakes on unhide ----
