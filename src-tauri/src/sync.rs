@@ -173,7 +173,10 @@ pub struct FoundNetwork {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberView {
-    pub id: u64,
+    // String, not u64: ids exceed 2^53, and JS serializes large JSON
+    // numbers through f64 — a numeric id round-trips back as a DIFFERENT
+    // integer and kick/targeted-publish silently hit a non-existent key.
+    pub id: String,
     pub name: String,
     pub online: bool,
     #[serde(rename = "appliedVersion")]
@@ -849,23 +852,6 @@ pub fn host_kick(hs: &SharedHost, store_path: &Path, member_id: u64) -> Result<S
     Ok(format!("✓ kicked {name} — they can rejoin with the code"))
 }
 
-/// Remove a member row WITHOUT banning — for ghost rows left by members
-/// who left before /leave existed or whose ids changed across reinstalls.
-pub fn host_forget(hs: &SharedHost, store_path: &Path, member_id: u64) -> Result<String> {
-    let mut g = hs.lock().unwrap();
-    let h = g.as_mut().context("not hosting")?;
-    let name = h
-        .members
-        .get(&member_id)
-        .map(|m| m.name.clone())
-        .unwrap_or_else(|| format!("member {member_id}"));
-    h.members.remove(&member_id);
-    h.targets.remove(&member_id);
-    crate::alog!("host", "forgot {name} ({member_id}) — not banned");
-    save_host(store_path, h);
-    Ok(format!("✓ forgot {name} — their row is gone"))
-}
-
 pub fn host_stop(hs: &SharedHost, store_path: &Path) {
     if let Some(h) = hs.lock().unwrap().take() {
         h.stop.store(true, Ordering::Relaxed);
@@ -1045,7 +1031,7 @@ fn member_views(h: &HostState) -> Vec<MemberView> {
         .members
         .values()
         .map(|m| MemberView {
-            id: m.id,
+            id: m.id.to_string(),
             name: m.name.clone(),
             online: now.saturating_sub(m.last_seen) < ONLINE_WINDOW_SECS,
             applied_version: m.applied_version,
@@ -1059,7 +1045,7 @@ fn member_views(h: &HostState) -> Vec<MemberView> {
     v.insert(
         0,
         MemberView {
-            id: 0,
+            id: "0".into(),
             name: machine_name(),
             online: true,
             applied_version: h.manifest.version,

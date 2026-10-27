@@ -9,7 +9,6 @@ import {
   connectStatus,
   declineUpdate,
   detectLaunchers,
-  hostForget,
   hostKick,
   hostPublish,
   hostSetFolder,
@@ -74,7 +73,7 @@ export default function ConnectView(_props: Props) {
     lv: "",
   });
   const [note, setNote] = useState("");
-  const [pubTarget, setPubTarget] = useState<number | "all">("all");
+  const [pubTarget, setPubTarget] = useState<string | "all">("all");
   // edit-network form (hosting view)
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState("");
@@ -428,7 +427,7 @@ export default function ConnectView(_props: Props) {
     }
   };
 
-  const doKick = async (id: number, name: string) => {
+  const doKick = async (id: string, name: string) => {
     if (
       !(await confirm(`Kick ${name} from the network?\nThey can rejoin with the join code.`, {
         title: "Kick member",
@@ -441,28 +440,6 @@ export default function ConnectView(_props: Props) {
     setBusy(true);
     try {
       pushLog(await hostKick(id));
-      await refresh();
-    } catch (e) {
-      pushLog(`x ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Remove a dead row without banning — ghosts from members who left
-  // before /leave existed, or whose ids changed.
-  const doForget = async (id: number, name: string) => {
-    if (
-      !(await confirm(
-        `Forget ${name}? Their row is removed — they are NOT banned and can rejoin anytime.`,
-        { title: "Forget member", okLabel: "Forget", cancelLabel: "Cancel" }
-      ))
-    ) {
-      return;
-    }
-    setBusy(true);
-    try {
-      pushLog(await hostForget(id));
       await refresh();
     } catch (e) {
       pushLog(`x ${e}`);
@@ -586,24 +563,13 @@ export default function ConnectView(_props: Props) {
               {canKick && (
                 <td>
                   {!m.host && (
-                    <>
-                      {!m.online && (
-                        <button
-                          className="row-del"
-                          title={`Forget ${m.name} — remove this row (not banned)`}
-                          onClick={() => doForget(m.id, m.name)}
-                        >
-                          –
-                        </button>
-                      )}
-                      <button
-                        className="row-del"
-                        title={`Kick ${m.name} — blocked until they rejoin with the code`}
-                        onClick={() => doKick(m.id, m.name)}
-                      >
-                        ×
-                      </button>
-                    </>
+                    <button
+                      className="row-del"
+                      title={`Kick ${m.name} — blocked until they rejoin with the code`}
+                      onClick={() => doKick(m.id, m.name)}
+                    >
+                      ×
+                    </button>
                   )}
                 </td>
               )}
@@ -715,11 +681,7 @@ export default function ConnectView(_props: Props) {
           <div className="toolbar">
             <select
               value={pubTarget}
-              onChange={(e) =>
-                setPubTarget(
-                  e.target.value === "all" ? "all" : Number(e.target.value)
-                )
-              }
+              onChange={(e) => setPubTarget(e.target.value)}
             >
               <option value="all">Publish to everyone</option>
               {status.members

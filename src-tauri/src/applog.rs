@@ -1,6 +1,6 @@
 //! Always-on session logging — one file per app session under
-//! `<app data>\logs\session-<epoch>.log`, compacted to the newest ~500
-//! lines and pruned to the newest 5 sessions. Every network, transfer,
+//! `<app data>\logs\session-<epoch>.log`, compacted to the newest ~4000
+//! lines and pruned to the newest 20 sessions. Every network, transfer,
 //! membership and tray boundary writes here so a bug report comes with
 //! the actual trace instead of code archaeology.
 
@@ -18,11 +18,11 @@ struct AppLog {
 }
 
 /// Compact when a file passes this many lines…
-const MAX_LINES: usize = 600;
+const MAX_LINES: usize = 5000;
 /// …down to the newest this many.
-const KEEP_LINES: usize = 500;
+const KEEP_LINES: usize = 4000;
 /// Retain at most this many session files total.
-const MAX_FILES: usize = 5;
+const MAX_FILES: usize = 20;
 
 fn now_secs() -> u64 {
     SystemTime::now()

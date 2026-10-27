@@ -184,7 +184,7 @@ export interface FoundNetwork {
 }
 
 export interface MemberView {
-  id: number;
+  id: string; // string — real ids exceed 2^53, JS numbers can't carry them
   name: string;
   online: boolean;
   appliedVersion: number;
@@ -270,7 +270,7 @@ export const uiLog = (tag: string, msg: string) =>
 
 export const hostPublish = (
   note: string,
-  target: number | null,
+  target: string | null,
   allowEmpty = false,
   force = false,
   meta?: PublishMeta
@@ -321,12 +321,8 @@ export interface PackMetaSuggest {
 export const suggestPackMeta = (folder: string) =>
   invoke<PackMetaSuggest>("suggest_pack_meta", { folder });
 
-export const hostKick = (memberId: number) =>
+export const hostKick = (memberId: string) =>
   invoke<string>("host_kick", { memberId });
-
-/** Remove a member row without banning — for ghosts, not kicks. */
-export const hostForget = (memberId: number) =>
-  invoke<string>("host_forget", { memberId });
 
 export const hostStop = () => invoke<void>("host_stop");
 

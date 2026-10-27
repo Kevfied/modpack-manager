@@ -490,7 +490,7 @@ fn main() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["id"] == alice_mid)
+            .find(|m| m["id"] == alice_mid.to_string())
             .unwrap();
         check(alice["targeted"] == true, "member list flags alice as targeted");
         // alice applies → target retires, she's back on the global stream
@@ -509,7 +509,7 @@ fn main() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["id"] == alice_mid)
+            .find(|m| m["id"] == alice_mid.to_string())
             .unwrap();
         check(alice2["targeted"] == false && alice2["upToDate"] == true,
             "target retired after apply — alice up to date");
@@ -619,7 +619,7 @@ fn main() {
         let v: serde_json::Value = r.json().await.unwrap();
         check(v["kicked"] == true, "kicked member's heartbeat returns kicked flag");
         check(
-            v["members"].as_array().unwrap().iter().all(|m| m["id"] != 42),
+            v["members"].as_array().unwrap().iter().all(|m| m["id"] != "42"),
             "kicked member removed from list",
         );
         // kicked member is locked out of file/manifest endpoints even WITH the code
@@ -773,9 +773,9 @@ fn main() {
             .await
             .unwrap();
         let members = v["members"].as_array().unwrap();
-        let eve_rows = members.iter().filter(|m| m["id"] == 7777).count();
+        let eve_rows = members.iter().filter(|m| m["id"] == "7777").count();
         check(
-            eve_rows == 1 && members.iter().any(|m| m["id"] == 7777 && m["name"] == "eve-renamed"),
+            eve_rows == 1 && members.iter().any(|m| m["id"] == "7777" && m["name"] == "eve-renamed"),
             "rejoin merged — one row, new name, no duplicate",
         );
         // memberId 0 is reserved for the host row — server must assign one
@@ -826,7 +826,7 @@ fn main() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["id"] == alice_id)
+            .find(|m| m["id"] == alice_id.to_string())
             .unwrap();
         check(
             a["appliedVersion"].as_u64().unwrap_or(999) == alice_applied,
@@ -837,7 +837,7 @@ fn main() {
         );
         check(a["upToDate"] == true, "rejoined alice not marked behind");
 
-        // ---- 9h. targeted publish dies with leave/forget; forget ≠ ban ----
+        // ---- 9h. targeted publish dies with leave ----
         println!("== target cleanup ==");
         let r = http
             .post(format!("http://{addr}/join"))
@@ -898,10 +898,10 @@ fn main() {
             .await
             .unwrap();
         check(
-            v["members"].as_array().unwrap().iter().all(|m| m["id"] != 8888),
+            v["members"].as_array().unwrap().iter().all(|m| m["id"] != "8888"),
             "leave removed eve2's roster row",
         );
-        // forget: same cleanup, no ban — the id can rejoin immediately
+        // a removed-but-not-banned member can rejoin immediately
         let r = http
             .post(format!("http://{addr}/join"))
             .json(&serde_json::json!({"code": "newcode", "memberId": 8888, "name": "eve2"}))
@@ -909,17 +909,6 @@ fn main() {
             .await
             .unwrap();
         check(r.status().is_success(), "left member rejoins freely");
-        sync::host_forget(&hs, &store_path, 8888).unwrap();
-        let r = http
-            .post(format!("http://{addr}/join"))
-            .json(&serde_json::json!({"code": "newcode", "memberId": 8888, "name": "eve2"}))
-            .send()
-            .await
-            .unwrap();
-        check(
-            r.status().is_success(),
-            "forgot member is NOT banned — instant rejoin ok",
-        );
         // clean up eve2's row for the roster count later
         let _ = http
             .post(format!("http://{addr}/leave"))
@@ -969,7 +958,7 @@ fn main() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|m| m["id"] != alice_id),
+                .all(|m| m["id"] != alice_id.to_string()),
             "old host dropped alice's row on network switch",
         );
         // …and back — the fake host must get its own /leave too
@@ -1429,7 +1418,7 @@ fn main() {
             ),
         );
         check(
-            saved_members.iter().any(|m| m["id"] == 5555),
+            saved_members.iter().any(|m| m["id"] == 5555), // stored Member.id stays u64
             "offline ghost row is part of the persisted roster",
         );
         let cs2: sync::SharedClient = Arc::new(Mutex::new(None));

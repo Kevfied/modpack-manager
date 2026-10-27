@@ -1088,12 +1088,17 @@ pub fn install_app_update(dir: &Path) -> Result<String> {
         )
         .display()
         .to_string();
+    // Persist a trace of every install attempt — when the app won't come
+    // back we need to know whether the script even ran, not just guess.
+    let log = dir.join("logs").join("install.log").display().to_string();
     let body = format!(
         concat!(
             "@echo off\r\n",
             "setlocal EnableDelayedExpansion\r\n",
             "set \"APP={exe}\"\r\n",
             "set \"PREV={prev}\"\r\n",
+            "set \"LOG={log}\"\r\n",
+            "echo [%date% %time%] update.cmd start app=\"%APP%\" installer=\"{installer}\">> \"%LOG%\"\r\n",
             "set tries=0\r\n",
             ":waitexit\r\n",
             // timeout.exe needs a console — this runs CREATE_NO_WINDOW, so
@@ -1104,7 +1109,9 @@ pub fn install_app_update(dir: &Path) -> Result<String> {
             "set /a tries+=1\r\n",
             "if !tries! lss 60 goto waitexit\r\n",
             ":unlocked\r\n",
+            "echo [%date% %time%] old process released exe — running installer>> \"%LOG%\"\r\n",
             "\"{installer}\" /S\r\n",
+            "echo [%date% %time%] installer parent returned>> \"%LOG%\"\r\n",
             "set tries=0\r\n",
             "set lasts=x\r\n",
             ":waitfile\r\n",
@@ -1123,12 +1130,17 @@ pub fn install_app_update(dir: &Path) -> Result<String> {
             // Install never produced an exe — put the backup back so the
             // app still opens (old version) instead of leaving a dead icon.
             ":restore\r\n",
-            "if not exist \"%APP%\" copy /y \"%PREV%\" \"%APP%\" >nul\r\n",
+            "if not exist \"%APP%\" (\r\n",
+            "  copy /y \"%PREV%\" \"%APP%\" >nul\r\n",
+            "  echo [%date% %time%] install timed out — restored previous exe>> \"%LOG%\"\r\n",
+            ")\r\n",
             ":launch\r\n",
+            "echo [%date% %time%] launching \"%APP%\">> \"%LOG%\"\r\n",
             "start \"\" \"%APP%\"\r\n",
         ),
         exe = exe,
         prev = prev,
+        log = log,
         installer = p.display(),
     );
     std::fs::write(&script, body).context("failed to write update.cmd")?;
@@ -1140,6 +1152,7 @@ pub fn install_app_update(dir: &Path) -> Result<String> {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — no console flash
     }
     cmd.spawn().context("failed to launch installer")?;
+    crate::alog!("app", "update.cmd spawned (log → {})", log);
     Ok(format!("installing {}", p.display()))
 }
 

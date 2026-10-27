@@ -306,7 +306,9 @@ fn ui_log(tag: String, msg: String) {
 async fn host_publish(
     state: tauri::State<'_, AppState>,
     note: String,
-    target: Option<u64>,
+    // String, not u64 — member ids exceed 2^53 and a JS number can't carry
+    // them without precision loss (the wrong member gets targeted).
+    target: Option<String>,
     allow_empty: bool,
     force: bool,
     pack_name: String,
@@ -316,6 +318,7 @@ async fn host_publish(
     loader_version: String,
 ) -> Result<String, String> {
     crate::alog!("host", "host_publish invoked (target={target:?}, force={force})");
+    let target: Option<u64> = target.and_then(|t| t.parse().ok());
     let host = state.host.clone();
     let sp = sync::store_path();
     tauri::async_runtime::spawn_blocking(move || {
@@ -430,15 +433,12 @@ async fn suggest_pack_meta(
 }
 
 /// Kick a member — they're removed and blocked until they rejoin with the code.
+/// `member_id` is a string at the JS boundary — the real ids exceed 2^53
+/// and a JS number would round them to a different value (silent no-op).
 #[tauri::command]
-fn host_kick(state: tauri::State<'_, AppState>, member_id: u64) -> Result<String, String> {
-    sync::host_kick(&state.host, &sync::store_path(), member_id).map_err(|e| e.to_string())
-}
-
-/// Remove a member row WITHOUT banning — for ghosts, not for kicks.
-#[tauri::command]
-fn host_forget(state: tauri::State<'_, AppState>, member_id: u64) -> Result<String, String> {
-    sync::host_forget(&state.host, &sync::store_path(), member_id).map_err(|e| e.to_string())
+fn host_kick(state: tauri::State<'_, AppState>, member_id: String) -> Result<String, String> {
+    let id: u64 = member_id.parse().map_err(|_| "bad member id".to_string())?;
+    sync::host_kick(&state.host, &sync::store_path(), id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -836,10 +836,32 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // Logging + panic capture BEFORE any Tauri machinery — a crash in
+    // plugin init or webview creation must still leave a trace, or "the
+    // app won't start" stays a guess.
+    let dir = update_app_dir();
+    applog::init(&dir);
+    alog!(
+        "app",
+        "process spawned v{} pid={} exe={:?} args={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        std::env::args().collect::<Vec<_>>()
+    );
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        alog!("panic", "{info}\n{bt}");
+        default_hook(info);
+    }));
+    let builder = tauri::Builder::default()
         // Single-instance FIRST — a second launch focuses the trayed
         // window instead of spawning a zombie that can't bind the port.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            alog!("app", "second-instance launch — focusing the running one");
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -855,9 +877,7 @@ pub fn run() {
             resumed: AtomicBool::new(false),
         })
         .setup(|app| {
-            // Session logging first — everything below writes to it.
-            applog::init(&update_app_dir());
-            alog!("app", "starting {}", env!("CARGO_PKG_VERSION"));
+            alog!("app", "setup() entered — plugins + webview survived");
             // Autostart: default ON, but only an explicit "0" means off.
             // The flag file outlives reinstalls/updates — the registry Run
             // key doesn't — so a once-written flag can't be trusted; check
@@ -885,11 +905,13 @@ pub fn run() {
             // App-update channel: anchor dirs, purge stale artifacts, and
             // start the passive listener + seeder announcer.
             let dir = update_app_dir();
+            alog!("app", "app-update init (dir={})", dir.display());
             appupdate::init(&dir);
             appupdate::launch_purge(&dir);
             appupdate::start_update_listener();
             let st = app.state::<AppState>();
             appupdate::start_update_announcer(st.host.clone(), dir);
+            alog!("app", "update listener + announcer up");
             // Discovery hooks → UI events, so new networks/seeders appear
             // instantly instead of on the next poll tick.
             use tauri::Emitter;
@@ -906,12 +928,15 @@ pub fn run() {
             // on the first connect_status poll means a --tray cold start
             // whose default view isn't Connect would never re-host until
             // someone opened the tab. Sessions must not depend on the UI.
+            alog!("app", "resuming saved sessions…");
             if let Ok(root) = sync::synced_root() {
                 sync::resume(&st.host, &st.sync_client, &sync::store_path(), &root);
                 st.resumed.store(true, Ordering::Relaxed);
             }
+            alog!("app", "session resume returned");
 
             // Tray: X hides to the icon; real quit lives on the menu.
+            alog!("app", "building tray…");
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
@@ -941,6 +966,7 @@ pub fn run() {
                 tray = tray.icon(icon.clone());
             }
             let _tray = tray.build(app)?;
+            alog!("app", "tray built");
 
             // --tray (autostart launches) → stay hidden; otherwise show.
             if let Some(w) = app.get_webview_window("main") {
@@ -950,8 +976,12 @@ pub fn run() {
                     set_window_hidden(&h, true);
                 } else {
                     let _ = w.show();
+                    alog!("app", "main window shown");
                 }
+            } else {
+                alog!("app", "!! no 'main' window exists after setup");
             }
+            alog!("app", "setup() finished Ok");
             Ok(())
         })
         .on_window_event(|win, ev| {
@@ -987,7 +1017,6 @@ pub fn run() {
             suggest_pack_meta,
             ui_log,
             host_kick,
-            host_forget,
             host_stop,
             scan_networks,
             join_network,
@@ -1014,7 +1043,27 @@ pub fn run() {
             update_seeders,
             open_logs_dir,
             tail_log,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while building tauri application");
+        ]);
+    builder
+        .build(tauri::generate_context!())
+        .map_err(|e| {
+            alog!("app", "BUILD FAILED: {e}");
+            e
+        })
+        .expect("error while building tauri application")
+        .run(|_app, event| match event {
+            // "ready" = survived startup completely; ExitRequested/Exit
+            // mark a clean shutdown — a log that just stops means the
+            // process died (crash, kill, or webview teardown).
+            tauri::RunEvent::Ready => alog!("app", "event loop ready — startup complete"),
+            tauri::RunEvent::ExitRequested { .. } => alog!("app", "exit requested"),
+            tauri::RunEvent::Exit => alog!("app", "exited"),
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } => alog!("app", "window destroyed: {label}"),
+            _ => {}
+        });
+    alog!("app", "event loop returned — process ending");
 }
