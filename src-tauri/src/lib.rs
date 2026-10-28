@@ -268,6 +268,35 @@ async fn load_pack_file(
         .map_err(|e| e.to_string())
 }
 
+/// Merge extra-mods/ into mods/ for every deployed pack instance —
+/// covers jars dropped while the app (and its UI-refresh merge) wasn't
+/// running, so a player can drop a jar, launch the game, and it loads.
+fn merge_extras_all(host: &sync::SharedHost) {
+    let mut names: Vec<String> = sync::synced_root()
+        .map(|r| {
+            sync::list_synced_packs(&r)
+                .into_iter()
+                .map(|p| p.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(h) = host.lock().unwrap().as_ref() {
+        names.push(h.pack_name.clone());
+    }
+    if names.is_empty() {
+        return;
+    }
+    for l in &launchers::detect().launchers {
+        for n in &names {
+            if let Some(g) = launchers::gamedir_for(l, n) {
+                if g.is_dir() {
+                    pack::merge_extra_mods(&g);
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------- Connect
 
 #[tauri::command]
@@ -959,6 +988,17 @@ pub fn run() {
                 st.resumed.store(true, Ordering::Relaxed);
             }
             alog!("app", "session resume dispatched");
+
+            // Extra Mods sweep: merge any jars dropped into deployed
+            // instances' extra-mods/ while the app wasn't running — the
+            // UI-refresh merge only covers the live Connect tab.
+            {
+                let host = st.host.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    merge_extras_all(&host);
+                    crate::alog!("app", "extra-mods sweep done");
+                });
+            }
 
             // Tray: X hides to the icon; real quit lives on the menu.
             alog!("app", "building tray…");
