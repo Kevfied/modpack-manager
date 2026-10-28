@@ -43,6 +43,13 @@ Strict rule: nothing is published/applied without an explicit user action.
   resolve loader version). Connect member apply, host apply
   (`load_host_pack`), and Loader-folder loads all funnel through it —
   don't fork the logic.
+- Deployed instances preserve player extras: `mods/.mm-managed.json`
+  tracks files we placed (pack jars + merged extras); pruning only
+  removes previously-managed jars. `extra-mods/` next to `mods/` is the
+  player's drop folder — merged into `mods/` at deploy, UI refresh, and
+  via the "Extra Mods" button (`open_extra_mods`). Helpers live in
+  `pack.rs`; `pack::stage_instance` and the zip/mrpack installers honor
+  the same rule.
 - Launcher detection (`launchers::detect`) must be evidence-based:
   `.minecraft` alone is NOT the official launcher (every custom launcher
   uses it) — it requires the launcher exe / Store package. SKLauncher is
