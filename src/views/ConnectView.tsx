@@ -20,6 +20,7 @@ import {
   listSyncedPacks,
   loadHostPack,
   loadSyncedPack,
+  openExtraMods,
   packExists,
   scanNetworks,
   suggestPackMeta,
@@ -96,6 +97,8 @@ export default function ConnectView(_props: Props) {
   // Which detected launcher already holds the pack — powers the
   // persistent "installed ✓" state and the guide's last step.
   const [installedIn, setInstalledIn] = useState<string | null>(null);
+  // Every launcher holding the pack — Extra Mods button shows per row.
+  const [installedList, setInstalledList] = useState<Set<string>>(new Set());
   // live download progress while apply_update streams files
   const [applyProg, setApplyProg] = useState<ApplyProgress | null>(null);
   // Byte samples for the download speed/ETA readout.
@@ -183,7 +186,9 @@ export default function ConnectView(_props: Props) {
         const hits = await Promise.all(
           d.launchers.map(async (l) => ((await packExists(l, name)) ? l.name : null))
         );
-        setInstalledIn(hits.find((x) => x) ?? null);
+        const names = hits.filter((x): x is string => !!x);
+        setInstalledIn(names[0] ?? null);
+        setInstalledList(new Set(names));
       })().catch((e) => pushLog(`x launcher detection: ${e}`));
     };
     load();
@@ -214,10 +219,30 @@ export default function ConnectView(_props: Props) {
       // the backend funnels both through the same code.
       pushLog(hosting ? await loadHostPack(l) : await loadSyncedPack(nid!, l));
       setInstalledIn(l.name); // instant "go play" — poll confirms later
+      setInstalledList((s) => new Set(s).add(l.name));
     } catch (e) {
       pushLog(`x ${e}`);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const packNameFor = () =>
+    hosting
+      ? status?.packName ?? "Pack"
+      : syncedPack?.name || status?.networkName || "Synced Pack";
+
+  // "Extra Mods" — the player's personal drop folder inside the deployed
+  // instance. Jars there are copied into mods/ on every apply/deploy and
+  // survive pack updates.
+  const extraMods = async (l: LauncherInfo) => {
+    try {
+      await openExtraMods(l, packNameFor());
+      pushLog(
+        `✓ ${l.name}: extra-mods folder opened — jars there survive pack updates`
+      );
+    } catch (e) {
+      pushLog(`x extra mods: ${e}`);
     }
   };
 
@@ -736,16 +761,26 @@ export default function ConnectView(_props: Props) {
                   pack your members get:
                 </div>
                 {launchers.map((l) => (
-                  <button
-                    key={l.kind}
-                    className="primary"
-                    style={{ marginRight: 8, marginBottom: 6 }}
-                    disabled={busy}
-                    onClick={() => loadSyncedInto(l)}
-                  >
-                    {l.name}
-                    {installedIn === l.name ? " ✓" : ""}
-                  </button>
+                  <span key={l.kind}>
+                    <button
+                      className="primary"
+                      style={{ marginRight: 4, marginBottom: 6 }}
+                      disabled={busy}
+                      onClick={() => loadSyncedInto(l)}
+                    >
+                      {l.name}
+                      {installedIn === l.name ? " ✓" : ""}
+                    </button>
+                    {installedList.has(l.name) && (
+                      <button
+                        style={{ marginRight: 8, marginBottom: 6 }}
+                        title="Drop extra client-side .jar mods here — pack updates never delete them"
+                        onClick={() => extraMods(l)}
+                      >
+                        Extra Mods
+                      </button>
+                    )}
+                  </span>
                 ))}
               </>
             )}
@@ -1055,16 +1090,26 @@ export default function ConnectView(_props: Props) {
                   install it into:
                 </div>
                 {launchers.map((l) => (
-                  <button
-                    key={l.kind}
-                    className="primary"
-                    style={{ marginRight: 8, marginBottom: 6 }}
-                    disabled={busy}
-                    onClick={() => loadSyncedInto(l)}
-                  >
-                    {l.name}
-                    {installedIn === l.name ? " ✓" : ""}
-                  </button>
+                  <span key={l.kind}>
+                    <button
+                      className="primary"
+                      style={{ marginRight: 4, marginBottom: 6 }}
+                      disabled={busy}
+                      onClick={() => loadSyncedInto(l)}
+                    >
+                      {l.name}
+                      {installedIn === l.name ? " ✓" : ""}
+                    </button>
+                    {installedList.has(l.name) && (
+                      <button
+                        style={{ marginRight: 8, marginBottom: 6 }}
+                        title="Drop extra client-side .jar mods here — pack updates never delete them"
+                        onClick={() => extraMods(l)}
+                      >
+                        Extra Mods
+                      </button>
+                    )}
+                  </span>
                 ))}
               </>
             )}
@@ -1100,17 +1145,26 @@ export default function ConnectView(_props: Props) {
                   </p>
                   <div className="upd-actions">
                     {launchers.map((l) => (
-                      <button
-                        key={l.kind}
-                        className="primary"
-                        onClick={() => {
-                          setPickerOpen(false);
-                          loadSyncedInto(l);
-                        }}
-                      >
-                        {l.name}
-                        {installedIn === l.name ? " ✓" : ""}
-                      </button>
+                      <span key={l.kind}>
+                        <button
+                          className="primary"
+                          onClick={() => {
+                            setPickerOpen(false);
+                            loadSyncedInto(l);
+                          }}
+                        >
+                          {l.name}
+                          {installedIn === l.name ? " ✓" : ""}
+                        </button>
+                        {installedList.has(l.name) && (
+                          <button
+                            title="Drop extra client-side .jar mods here — pack updates never delete them"
+                            onClick={() => extraMods(l)}
+                          >
+                            Extra Mods
+                          </button>
+                        )}
+                      </span>
                     ))}
                   </div>
                 </>

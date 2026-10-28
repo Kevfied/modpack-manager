@@ -146,6 +146,9 @@ export interface PackFileInfo {
 export const packExists = (launcher: LauncherInfo, name: string) =>
   invoke<boolean>("pack_exists", { launcher, name });
 
+export const openExtraMods = (launcher: LauncherInfo, name: string) =>
+  invoke<void>("open_extra_mods", { launcher, name });
+
 export const packFileInfo = (path: string) =>
   invoke<PackFileInfo>("pack_file_info", { path });
 

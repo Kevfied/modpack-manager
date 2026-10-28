@@ -1508,23 +1508,56 @@ fn main() {
             launchers::pack_instance_exists(&prism, &packs[0].name),
             "overwrite detection sees the new instance",
         );
-        // Stale jars in the managed instance get mirror-deleted on reload.
+        // Extra-mods semantics: jars the player added (direct drop or via
+        // extra-mods/) survive updates; only files WE placed are pruned.
         let inst = prism_dir
             .join("instances")
             .join(&packs[0].name.to_lowercase().replace(' ', "-"));
-        let stale = inst.join(".minecraft/mods/stale-old.jar");
-        std::fs::write(&stale, b"stale").unwrap();
-        let notajar = inst.join(".minecraft/mods/note.txt");
+        let gamedir = inst.join(".minecraft");
+        let mods = gamedir.join("mods");
+        check(
+            launchers::gamedir_for(&prism, &packs[0].name).as_deref() == Some(gamedir.as_path()),
+            "gamedir_for resolves the deployed instance",
+        );
+        std::fs::write(mods.join("user-extra.jar"), b"mine").unwrap();
+        std::fs::create_dir_all(gamedir.join("extra-mods")).unwrap();
+        std::fs::write(gamedir.join("extra-mods/extra1.jar"), b"extra").unwrap();
+        // Managed-but-absent jar still gets pruned (host removed the mod).
+        std::fs::write(mods.join("ghost.jar"), b"gone").unwrap();
+        let mf = mods.join(".mm-managed.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mf).unwrap()).unwrap();
+        v["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("ghost.jar"));
+        std::fs::write(&mf, v.to_string()).unwrap();
+        let notajar = mods.join("note.txt");
         std::fs::write(&notajar, b"keep me").unwrap();
         let l2 = sync::load_synced_pack(&mr_client, &inst_root, &packs[0].network_id, &prism)
             .await
             .unwrap();
         println!("{l2}");
-        check(!stale.exists(), "stale jar mirror-deleted on reinstall");
+        check(!mods.join("ghost.jar").exists(), "stale managed jar pruned on reinstall");
+        check(mods.join("user-extra.jar").exists(), "player-dropped jar survives update");
+        check(mods.join("extra1.jar").is_file(), "extra-mods jar merged into mods/");
         check(notajar.exists(), "non-jar file in mods dir untouched");
         check(
-            inst.join(".minecraft/mods/alpha.jar").is_file(),
+            mods.join("alpha.jar").is_file(),
             "pack jar still present after mirror",
+        );
+        // Remove the extra → next deploy prunes it (it was managed).
+        std::fs::remove_file(gamedir.join("extra-mods/extra1.jar")).unwrap();
+        let _l3 = sync::load_synced_pack(&mr_client, &inst_root, &packs[0].network_id, &prism)
+            .await
+            .unwrap();
+        check(
+            !mods.join("extra1.jar").exists(),
+            "removed extra pruned from mods/ on next deploy",
+        );
+        check(
+            mods.join("user-extra.jar").exists(),
+            "direct-drop extra still survives after pruning",
         );
         let _ = vanilla; // vanilla path needs a real .minecraft — covered by packtest
 
@@ -1544,7 +1577,11 @@ fn main() {
                     .flatten()
                     .filter(|e| e.path().extension().map(|x| x == "jar").unwrap_or(false))
                     .count();
-                check(got == want, "host apply mirrors live folder into launcher");
+                // want + the player-dropped user-extra.jar, which survives.
+                check(
+                    got == want + 1,
+                    "host apply mirrors live folder + preserved extra into launcher",
+                );
             }
             Err(e) => check(false, &format!("load_host_pack failed: {e}")),
         }

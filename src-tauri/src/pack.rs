@@ -239,17 +239,115 @@ pub fn build_modlist(
 }
 
 /// Copy selected jars into `<instance_dir>/mods/`.
+/// Filenames we placed into a mods dir — pack jars + merged extra jars.
+/// Tracked so updates prune only OUR stale files and never touch jars a
+/// player added themselves ("extra mods").
+pub(crate) const MANAGED_FILE: &str = ".mm-managed.json";
+
+pub(crate) fn managed_set(mods: &Path) -> Option<std::collections::HashSet<String>> {
+    let s = std::fs::read_to_string(mods.join(MANAGED_FILE)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v["files"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect()
+    })
+}
+
+pub(crate) fn write_managed(mods: &Path, files: &std::collections::HashSet<String>) {
+    let mut v: Vec<&String> = files.iter().collect();
+    v.sort();
+    let _ = std::fs::write(
+        mods.join(MANAGED_FILE),
+        serde_json::to_string_pretty(&serde_json::json!({ "files": v })).unwrap_or_default(),
+    );
+}
+
+/// Extra jars a player dropped into the instance's `extra-mods/` folder —
+/// merged into mods/ at deploy time so updates preserve them but removing
+/// one from extra-mods removes it from mods/ too.
+pub(crate) fn extra_jar_names(gamedir: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_dir(gamedir.join("extra-mods"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x == "jar")
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Copy jars from an instance's `extra-mods/` into `mods/` and register
+/// them as managed so a later deploy can prune them when the player
+/// removes them. Called at deploy and opportunistically on UI refresh so
+/// a dropped jar is loadable without waiting for an update.
+pub fn merge_extra_mods(gamedir: &Path) {
+    let extras = extra_jar_names(gamedir);
+    if extras.is_empty() {
+        return;
+    }
+    let mods = gamedir.join("mods");
+    if std::fs::create_dir_all(&mods).is_err() {
+        return;
+    }
+    let mut managed = managed_set(&mods).unwrap_or_default();
+    for name in extras {
+        if std::fs::copy(gamedir.join("extra-mods").join(&name), mods.join(&name)).is_ok() {
+            managed.insert(name);
+        }
+    }
+    write_managed(&mods, &managed);
+}
+
+/// Remove jars in `mods_dir` that are absent from `want` but were placed
+/// by a previous staging (managed set). With no managed file — a
+/// pre-feature instance — prune everything absent once, so stale pack
+/// jars get cleaned up and the tracking file gets written from scratch.
+/// Jars a player dropped straight into mods/ are never touched.
+pub(crate) fn prune_unmanaged(
+    mods_dir: &Path,
+    want: &std::collections::HashSet<String>,
+) -> usize {
+    let prev = managed_set(mods_dir);
+    let mut removed = 0usize;
+    if let Ok(rd) = std::fs::read_dir(mods_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_jar = p.is_file() && p.extension().map(|x| x == "jar").unwrap_or(false);
+            if !is_jar {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if want.contains(&name) {
+                continue;
+            }
+            let managed = prev.as_ref().map(|m| m.contains(&name)).unwrap_or(true);
+            if managed && std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 pub fn stage_instance(instance_dir: &Path, all_mods: &[ModInfo], config: &PackConfig) -> Result<usize> {
     let sel = selected(all_mods, config);
     let mods_dir = instance_dir.join("mods");
     std::fs::create_dir_all(&mods_dir)?;
-    // Clean out stale jars from a previous staging of this instance.
-    for entry in std::fs::read_dir(&mods_dir)? {
-        let entry = entry?;
-        if entry.path().extension().map(|e| e == "jar") == Some(true) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    // What this staging will own: the selection plus any player extras.
+    let mut want: std::collections::HashSet<String> =
+        sel.iter().map(|m| safe_filename(&m.filename)).collect();
+    want.extend(extra_jar_names(instance_dir));
+    prune_unmanaged(&mods_dir, &want);
     let mut count = 0;
     for m in &sel {
         let dest = mods_dir.join(safe_filename(&m.filename));
@@ -258,6 +356,14 @@ pub fn stage_instance(instance_dir: &Path, all_mods: &[ModInfo], config: &PackCo
         }
         count += 1;
     }
+    // Extras land after the pack so a same-named extra wins.
+    for name in extra_jar_names(instance_dir) {
+        let _ = std::fs::copy(
+            instance_dir.join("extra-mods").join(&name),
+            mods_dir.join(&name),
+        );
+    }
+    write_managed(&mods_dir, &want);
     Ok(count)
 }
 

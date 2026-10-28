@@ -245,6 +245,12 @@ fn pack_exists(launcher: LauncherInfo, name: String) -> bool {
     launchers::pack_instance_exists(&launcher, &name)
 }
 
+/// Create + open the deployed instance's `extra-mods/` drop folder.
+#[tauri::command]
+fn open_extra_mods(launcher: LauncherInfo, name: String) -> Result<(), String> {
+    launchers::open_extra_mods(&launcher, &name).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn pack_file_info(path: String) -> Result<serde_json::Value, String> {
     launchers::pack_file_info(&path).map_err(|e| e.to_string())
@@ -1026,6 +1032,7 @@ pub fn run() {
             load_into_launcher,
             open_mrpack,
             pack_exists,
+            open_extra_mods,
             pack_file_info,
             load_pack_file,
             find_missing_deps,

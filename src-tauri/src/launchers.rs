@@ -712,6 +712,7 @@ pub async fn install_zip_tlauncher(
         }
     }
     let mut log = format!("✓ extracted {count} mod(s)\n");
+    pack::merge_extra_mods(&gamedir);
     tlauncher_stage_version(client, mc, config, &mut log).await?;
     log.push_str(&format!(
         "✓ modpack \"{dirname}\" ready — open TLauncher, pick it, press Play"
@@ -752,6 +753,7 @@ pub async fn install_mrpack_prism(path: &str, data_dir: &str) -> Result<String> 
             "components": components
         }))?,
     )?;
+    pack::merge_extra_mods(&instance.join(".minecraft"));
     log.push_str(&format!(
         "✓ wrote Prism instance \"{id}\" (MC {}, {} {}) — open Prism and launch it",
         deps.mc_version, deps.loader, deps.loader_version
@@ -805,6 +807,7 @@ pub async fn install_zip_vanilla(
         anyhow::bail!("set an MC version (Build tab) before loading a .zip");
     }
     let mut log = format!("✓ extracted {count} mod(s)\n");
+    pack::merge_extra_mods(&instance);
     let version_id = ensure_loader_version(client, mc, config, &mut log).await?;
     add_launcher_profile(mc, &name, &version_id, &instance)?;
     log.push_str(&format!("✓ profile \"{name}\" ready — press Play"));
@@ -855,6 +858,7 @@ pub fn install_zip_prism(path: &str, data_dir: &str, config: &PackConfig) -> Res
             }
         }
     }
+    pack::merge_extra_mods(&gamedir);
     std::fs::write(
         inst.join("instance.cfg"),
         format!("InstanceType=OneSix\nname={}\nicon=default\n", config.name),
@@ -879,7 +883,67 @@ pub fn install_zip_prism(path: &str, data_dir: &str, config: &PackConfig) -> Res
 }
 
 /// Does a pack/instance with this name already exist for this launcher?
+/// Where a deployed pack's game dir lives (the dir containing `mods/`),
+/// per launcher layout. Same resolution `pack_instance_exists` uses.
+pub fn gamedir_for(launcher: &LauncherInfo, name: &str) -> Option<PathBuf> {
+    let slug = pack::slugify(name);
+    match launcher.kind.as_str() {
+        "prism" => launcher
+            .data_dir
+            .as_deref()
+            .map(|dd| Path::new(dd).join("instances").join(&slug).join(".minecraft")),
+        "tlauncher" => {
+            let mc = launcher
+                .data_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(tlauncher_gamedir)?;
+            Some(mc.join("versions").join(tlauncher_dirname(name)))
+        }
+        _ => instances_root().ok().map(|r| r.join(&slug)),
+    }
+}
+
+/// Copy jars from an instance's `extra-mods/` into `mods/` — deploy calls
+/// this via sync_jars_ex; UI refresh calls it so a dropped jar is loadable
+/// without waiting for an update.
+pub use pack::merge_extra_mods;
+
+/// "Extra Mods" button: create + open the instance's `extra-mods/` drop
+/// folder. Jars there are merged into mods/ on every deploy and survive
+/// pack updates; removing a jar here removes it from mods/ on next deploy.
+pub fn open_extra_mods(launcher: &LauncherInfo, name: &str) -> Result<()> {
+    let gamedir = gamedir_for(launcher, name)
+        .filter(|g| g.is_dir())
+        .context("pack isn't installed in that launcher yet")?;
+    let dir = gamedir.join("extra-mods");
+    std::fs::create_dir_all(&dir)?;
+    let readme = dir.join("README.txt");
+    if !readme.exists() {
+        std::fs::write(
+            &readme,
+            "Drop extra client-side .jar mods here.\r\n\r\n\
+             - They are copied into mods/ when the pack updates\r\n\
+             \x20 or when you open this folder from Modpack Manager.\r\n\
+             - Pack updates will NEVER delete these jars.\r\n\
+             - Delete a jar here to remove it from mods/ on the next update.\r\n",
+        )?;
+    }
+    merge_extra_mods(&gamedir);
+    std::process::Command::new("explorer.exe")
+        .arg(&dir)
+        .spawn()
+        .context("open explorer")?;
+    Ok(())
+}
+
 pub fn pack_instance_exists(launcher: &LauncherInfo, name: &str) -> bool {
+    // Merge any jars dropped into extra-mods/ so they reach mods/ before
+    // the next launch, not just at deploy time. Runs on every UI refresh.
+    if let Some(gd) = gamedir_for(launcher, name).filter(|g| g.join("extra-mods").is_dir()) {
+        merge_extra_mods(&gd);
+    }
     let slug = pack::slugify(name);
     match launcher.kind.as_str() {
         "prism" => launcher
@@ -1017,7 +1081,22 @@ pub async fn load_pack_file(
 /// jars the source no longer has — a pack instance we manage should match
 /// the pack, not accumulate jars the host removed. Non-jar files and
 /// subdirs in dest are left alone. Returns (copied, removed).
+#[allow(dead_code)]
 pub fn sync_jars(src_dir: &Path, dest_mods: &Path) -> Result<(usize, usize)> {
+    sync_jars_ex(src_dir, dest_mods, None)
+}
+
+/// Mirror jars src→dest plus the instance's `extra-mods/` folder on top,
+/// then remove only previously-managed stale jars (tracked in
+/// `mods/.mm-managed.json`). Jars a player dropped straight into mods/
+/// are never touched. A missing managed file means a pre-feature
+/// instance — fall back to the old wipe-everything-absent rule once so
+/// stale pack jars get cleaned and tracking starts fresh.
+pub fn sync_jars_ex(
+    src_dir: &Path,
+    dest_mods: &Path,
+    gamedir: Option<&Path>,
+) -> Result<(usize, usize)> {
     std::fs::create_dir_all(dest_mods)?;
     let mut count = 0usize;
     let mut want = std::collections::HashSet::new();
@@ -1038,21 +1117,18 @@ pub fn sync_jars(src_dir: &Path, dest_mods: &Path) -> Result<(usize, usize)> {
             }
         }
     }
-    let mut removed = 0usize;
-    if let Ok(rd) = std::fs::read_dir(dest_mods) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let is_jar = p.is_file() && p.extension().map(|x| x == "jar").unwrap_or(false);
-            let in_pack = p
-                .file_name()
-                .map(|f| want.contains(&f.to_string_lossy().into_owned()))
-                .unwrap_or(false);
-            if is_jar && !in_pack {
-                let _ = std::fs::remove_file(&p);
-                removed += 1;
+    // Player extras merge in AFTER the pack so a same-named extra wins.
+    if let Some(gd) = gamedir {
+        for name in pack::extra_jar_names(gd) {
+            if std::fs::copy(gd.join("extra-mods").join(&name), dest_mods.join(&name)).is_ok()
+            {
+                want.insert(name);
+                count += 1;
             }
         }
     }
+    let removed = pack::prune_unmanaged(dest_mods, &want);
+    pack::write_managed(dest_mods, &want);
     Ok((count, removed))
 }
 
@@ -1074,7 +1150,7 @@ pub async fn deploy_mods_dir(
             let id = pack::slugify(&cfg.name);
             let inst = Path::new(dd).join("instances").join(&id);
             let gamedir = inst.join(".minecraft");
-            let (n, removed) = sync_jars(mods_dir, &gamedir.join("mods"))?;
+            let (n, removed) = sync_jars_ex(mods_dir, &gamedir.join("mods"), Some(&gamedir))?;
             if removed > 0 {
                 log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
             }
@@ -1107,7 +1183,7 @@ pub async fn deploy_mods_dir(
                 .or_else(tlauncher_gamedir)
                 .context("TLauncher game dir not found")?;
             let gamedir = tlauncher_stage_version(client, &mc, cfg, &mut log).await?;
-            let (n, removed) = sync_jars(mods_dir, &gamedir.join("mods"))?;
+            let (n, removed) = sync_jars_ex(mods_dir, &gamedir.join("mods"), Some(&gamedir))?;
             log.push_str(&format!("✓ staged {n} mod(s)\n"));
             if removed > 0 {
                 log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
@@ -1120,7 +1196,7 @@ pub async fn deploy_mods_dir(
         _ => {
             let mc = minecraft_dir().context(".minecraft not found")?;
             let instance = root.join(pack::slugify(&cfg.name));
-            let (n, removed) = sync_jars(mods_dir, &instance.join("mods"))?;
+            let (n, removed) = sync_jars_ex(mods_dir, &instance.join("mods"), Some(&instance))?;
             log.push_str(&format!("✓ staged {n} mod(s)\n"));
             if removed > 0 {
                 log.push_str(&format!("✓ removed {removed} outdated mod(s)\n"));
