@@ -263,6 +263,18 @@ pub(crate) fn write_managed(mods: &Path, files: &std::collections::HashSet<Strin
     );
 }
 
+/// True when `p` contains an `extra-mods` component. The name is reserved
+/// everywhere — publish/meta scans must never ship a player's private
+/// client-side jars to the network.
+pub(crate) fn is_extra_mods_path(p: &Path) -> bool {
+    p.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(|s| s.eq_ignore_ascii_case("extra-mods"))
+            .unwrap_or(false)
+    })
+}
+
 /// Extra jars a player dropped into the instance's `extra-mods/` folder —
 /// merged into mods/ at deploy time so updates preserve them but removing
 /// one from extra-mods removes it from mods/ too.

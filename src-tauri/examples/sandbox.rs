@@ -320,6 +320,10 @@ fn main() {
             .unwrap();
         check(info["name"] == "sandbox-net", "server binds + /info answers");
         check(info["latestVersion"] == 0, "STRICT: nothing published until button pressed");
+        // A jar under extra-mods/ inside the shared folder is the host's
+        // own — it must never reach the manifest or members.
+        std::fs::create_dir_all(host_mods.join("extra-mods")).unwrap();
+        make_jar(&host_mods.join("extra-mods/hidden.jar"), "hidden", "9.9");
         sync::host_publish(&hs, &store_path, "first", None, false, false, "", "", "", "", "").unwrap();
         let info: serde_json::Value = http
             .get(format!("http://{addr}/info"))
@@ -350,6 +354,10 @@ fn main() {
         check(pend.is_some(), "pending update v1 visible");
         let (m, _, _) = pend.unwrap();
         check(m.version == 1 && m.files.len() == 3, "manifest has 3 files");
+        check(
+            !m.files.iter().any(|f| f.path.contains("hidden")),
+            "extra-mods jar excluded from publish manifest",
+        );
 
         // ---- 4. apply v1 ----
         println!("== apply v1 ==");
@@ -358,6 +366,10 @@ fn main() {
         let nid = { cs.lock().unwrap().as_ref().unwrap().synced_dir.clone() };
         check(nid.join("mods/alpha.jar").is_file(), "alpha.jar downloaded");
         check(nid.join("mods/beta.jar").is_file(), "beta.jar downloaded");
+        check(
+            !nid.join("mods/extra-mods/hidden.jar").exists(),
+            "extra-mods jar never reaches the member",
+        );
         check(nid.join("pack.json").is_file(), "pack.json written");
         let pj: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(nid.join("pack.json")).unwrap())

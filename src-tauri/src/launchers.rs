@@ -1107,6 +1107,13 @@ pub fn sync_jars_ex(
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().map(|x| x == "jar").unwrap_or(false) {
+                // extra-mods/ inside a source folder is personal, not pack
+                // content — the instance's own extras mechanism merges it.
+                if let Ok(rel) = p.strip_prefix(src_dir) {
+                    if pack::is_extra_mods_path(rel) {
+                        continue;
+                    }
+                }
                 let name = p
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())

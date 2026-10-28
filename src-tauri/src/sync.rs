@@ -492,6 +492,10 @@ fn manifest_files_from_scan(
 ) -> Result<Vec<ManifestFile>> {
     let mut files: Vec<ManifestFile> = Vec::with_capacity(res.mods.len());
     for m in &res.mods {
+        // A jar under extra-mods/ is the host's own — never published.
+        if crate::pack::is_extra_mods_path(Path::new(&m.path)) {
+            continue;
+        }
         let Ok(rel) = Path::new(&m.path).strip_prefix(folder) else { continue };
         // Scanner leaves sha1 empty only when the file couldn't be opened —
         // hash it here so the error surfaces at publish instead of shipping
@@ -539,6 +543,9 @@ pub fn suggest_meta(mods: &[scanner::ModInfo]) -> (String, String) {
     let mut loader_votes: HashMap<String, usize> = HashMap::new();
     let mut ver_votes: HashMap<String, usize> = HashMap::new();
     for m in mods {
+        if crate::pack::is_extra_mods_path(Path::new(&m.path)) {
+            continue;
+        }
         for l in &m.loaders {
             *loader_votes.entry(normalize(l)).or_default() += 1;
         }
